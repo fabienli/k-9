@@ -24,7 +24,6 @@ import com.fsck.k9.mail.Message;
 import com.fsck.k9.mail.MessagingException;
 import com.fsck.k9.mail.filter.Base64;
 import com.fsck.k9.mail.ssl.TrustManagerFactory;
-import com.fsck.k9.mail.store.StoreConfig;
 import com.fsck.k9.mail.store.webdav.WebDavHttpClient.WebDavHttpClientFactory;
 import javax.net.ssl.SSLException;
 import javax.xml.parsers.ParserConfigurationException;
@@ -60,7 +59,7 @@ import static com.fsck.k9.mail.helper.UrlEncodingHelper.decodeUtf8;
  */
 @SuppressWarnings("deprecation")
 public class WebDavStore {
-    private final StoreConfig storeConfig;
+    private final DraftsFolderProvider draftsFolderProvider;
     private ConnectionSecurity mConnectionSecurity;
     private String username;
     private String alias;
@@ -84,13 +83,14 @@ public class WebDavStore {
     private WebDavFolder sendFolder = null;
     private Map<String, WebDavFolder> folderList = new HashMap<>();
 
-    public WebDavStore(TrustManagerFactory trustManagerFactory, WebDavStoreSettings serverSettings, StoreConfig storeConfig) {
-        this(trustManagerFactory, serverSettings, storeConfig, new WebDavHttpClient.WebDavHttpClientFactory());
+    public WebDavStore(TrustManagerFactory trustManagerFactory, WebDavStoreSettings serverSettings,
+            DraftsFolderProvider draftsFolderProvider) {
+        this(trustManagerFactory, serverSettings, draftsFolderProvider, new WebDavHttpClient.WebDavHttpClientFactory());
     }
 
-    public WebDavStore(TrustManagerFactory trustManagerFactory, WebDavStoreSettings serverSettings, StoreConfig storeConfig,
-            WebDavHttpClientFactory clientFactory) {
-        this.storeConfig = storeConfig;
+    public WebDavStore(TrustManagerFactory trustManagerFactory, WebDavStoreSettings serverSettings,
+            DraftsFolderProvider draftsFolderProvider, WebDavHttpClientFactory clientFactory) {
+        this.draftsFolderProvider = draftsFolderProvider;
         httpClientFactory = clientFactory;
         this.trustManagerFactory = trustManagerFactory;
 
@@ -150,10 +150,6 @@ public class WebDavStore {
 
     short getAuthentication() {
         return authenticationType;
-    }
-
-    StoreConfig getStoreConfig() {
-        return storeConfig;
     }
 
     public void checkSettings() throws MessagingException {
@@ -934,11 +930,11 @@ public class WebDavStore {
         return dataset;
     }
 
-    public void sendMessages(List<? extends Message> messages) throws MessagingException {
-        WebDavFolder tmpFolder = getFolder(storeConfig.getDraftsFolder());
+    public void sendMessages(List<Message> messages) throws MessagingException {
+        WebDavFolder tmpFolder = getFolder(draftsFolderProvider.getDraftsFolder());
         try {
             tmpFolder.open();
-            List<? extends Message> retMessages = tmpFolder.appendWebDavMessages(messages);
+            List<WebDavMessage> retMessages = tmpFolder.appendWebDavMessages(messages);
 
             tmpFolder.moveMessages(retMessages, getSendSpoolFolder());
         } finally {

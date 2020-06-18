@@ -10,7 +10,7 @@ if (rootProject.testCoverage) {
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:${versions.kotlin}"
 
-    implementation project(":app:ui")
+    implementation project(":app:ui:legacy")
     implementation project(":app:core")
     implementation project(":app:storage")
     implementation project(":app:crypto-openpgp")
@@ -19,9 +19,12 @@ dependencies {
     implementation project(":backend:webdav")
 
     implementation "androidx.appcompat:appcompat:${versions.androidxAppCompat}"
-    implementation "androidx.core:core-ktx:${versions.coreKtx}"
+    implementation "androidx.core:core-ktx:${versions.androidxCore}"
     implementation "com.takisoft.preferencex:preferencex:${versions.preferencesFix}"
     implementation "com.jakewharton.timber:timber:${versions.timber}"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:${versions.kotlinCoroutines}"
+
+    debugImplementation 'com.squareup.leakcanary:leakcanary-android:2.3'
 
     testImplementation "org.robolectric:robolectric:${versions.robolectric}"
     testImplementation "junit:junit:${versions.junit}"
@@ -40,13 +43,13 @@ android {
         applicationId "com.fsck.k9"
         testApplicationId "com.fsck.k9.tests"
 
-        versionCode 27009
-        versionName '5.710-SNAPSHOT'
+        versionCode 27016
+        versionName '5.717-SNAPSHOT'
 
         minSdkVersion buildConfig.minSdk
         targetSdkVersion buildConfig.targetSdk
 
-        generatedDensities = ['mdpi', 'hdpi', 'xhdpi']
+        vectorDrawables.useSupportLibrary = true
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -71,8 +74,7 @@ android {
             applicationIdSuffix ".debug"
             testCoverageEnabled rootProject.testCoverage
 
-            minifyEnabled true
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            minifyEnabled false
 
             buildConfigField "boolean", "DEVELOPER_MODE", "true"
         }
@@ -91,8 +93,12 @@ android {
         exclude 'META-INF/NOTICE'
         exclude 'META-INF/NOTICE.txt'
         exclude 'META-INF/README'
+        exclude 'META-INF/README.md'
+        exclude 'META-INF/CHANGES'
         exclude 'LICENSE.txt'
         exclude 'META-INF/*.kotlin_module'
+        exclude 'META-INF/*.version'
+        exclude 'kotlin/**'
     }
 
     compileOptions {

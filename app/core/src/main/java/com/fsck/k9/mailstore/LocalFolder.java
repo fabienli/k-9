@@ -60,7 +60,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -88,7 +87,7 @@ public class LocalFolder {
     private FolderType type = FolderType.REGULAR;
     private String serverId = null;
     private String name;
-    private long databaseId = -1;
+    private long databaseId = -1L;
     private int visibleLimit = -1;
     private String prefId = null;
 
@@ -118,12 +117,6 @@ public class LocalFolder {
         this.name = name;
         this.type = type;
         attachmentInfoExtractor = localStore.getAttachmentInfoExtractor();
-
-        if (getServerId().equals(getAccount().getInboxFolder())) {
-            syncClass =  FolderClass.FIRST_CLASS;
-            pushClass =  FolderClass.FIRST_CLASS;
-            isInTopGroup = true;
-        }
     }
 
     public LocalFolder(LocalStore localStore, long databaseId) {
@@ -179,13 +172,10 @@ public class LocalFolder {
                         }
 
                         if (cursor.moveToFirst() && !cursor.isNull(LocalStore.FOLDER_ID_INDEX)) {
-                            int folderId = cursor.getInt(LocalStore.FOLDER_ID_INDEX);
-                            if (folderId > 0) {
-                                open(cursor);
-                            }
+                            open(cursor);
                         } else {
                             throw new MessagingException("LocalFolder.open(): Folder not found: " +
-                                    serverId + " (" + databaseId + ")");
+                                    serverId + " (" + databaseId + ")", true);
                         }
                     } catch (MessagingException e) {
                         throw new WrappedException(e);
@@ -201,7 +191,7 @@ public class LocalFolder {
     }
 
     void open(Cursor cursor) throws MessagingException {
-        databaseId = cursor.getInt(LocalStore.FOLDER_ID_INDEX);
+        databaseId = cursor.getLong(LocalStore.FOLDER_ID_INDEX);
         serverId = cursor.getString(LocalStore.FOLDER_SERVER_ID_INDEX);
         visibleLimit = cursor.getInt(LocalStore.FOLDER_VISIBLE_LIMIT_INDEX);
         status = cursor.getString(LocalStore.FOLDER_STATUS_INDEX);
@@ -228,7 +218,7 @@ public class LocalFolder {
     }
 
     public boolean isOpen() {
-        return (databaseId != -1 && serverId != null);
+        return (databaseId != -1L && name != null);
     }
 
     public String getServerId() {
@@ -269,8 +259,8 @@ public class LocalFolder {
             public Boolean doDbWork(final SQLiteDatabase db) throws WrappedException {
                 Cursor cursor = null;
                 try {
-                    cursor = db.rawQuery("SELECT id FROM folders where folders.server_id = ?",
-                            new String[] { LocalFolder.this.getServerId() });
+                    cursor = db.rawQuery("SELECT id FROM folders where id = ?",
+                            new String[] { Long.toString(getDatabaseId()) });
                     if (cursor.moveToFirst()) {
                         int folderId = cursor.getInt(0);
                         return (folderId > 0);
@@ -282,22 +272,6 @@ public class LocalFolder {
                 }
             }
         });
-    }
-
-    /**
-     * Creates a local-only folder.
-     */
-    public boolean create() throws MessagingException {
-        if (exists()) {
-            throw new MessagingException("Folder " + serverId + " already exists.");
-        }
-
-        localOnly = true;
-
-        int visibleLimit = getAccount().getDisplayCount();
-        this.localStore.createFolders(Collections.singletonList(this), visibleLimit);
-
-        return true;
     }
 
     PreferencesHolder getPreferencesHolder() {
@@ -346,10 +320,6 @@ public class LocalFolder {
         boolean integrate = isIntegrate;
     }
 
-    public void close() {
-        databaseId = -1;
-    }
-
     public int getMessageCount() throws MessagingException {
         try {
             return this.localStore.getDatabase().execute(false, new DbCallback<Integer>() {
@@ -379,7 +349,7 @@ public class LocalFolder {
     }
 
     public int getUnreadMessageCount() throws MessagingException {
-        if (databaseId == -1) {
+        if (databaseId == -1L) {
             open();
         }
 
@@ -572,10 +542,8 @@ public class LocalFolder {
                     try {
                         open();
                         if (fp.contains(FetchProfile.Item.BODY)) {
-                            for (Message message : messages) {
-                                LocalMessage localMessage = (LocalMessage) message;
-
-                                loadMessageParts(db, localMessage);
+                            for (LocalMessage message : messages) {
+                                loadMessageParts(db, message);
                             }
                         }
                     } catch (MessagingException e) {
@@ -846,14 +814,14 @@ public class LocalFolder {
         open();
 
         String accountUuid = getAccountUuid();
-        String folderServerId = getServerId();
+        long folderId = getDatabaseId();
 
         List<LocalMessage> messages = new ArrayList<>();
         for (MessageReference messageReference : messageReferences) {
             if (!accountUuid.equals(messageReference.getAccountUuid())) {
                 throw new IllegalArgumentException("all message references must belong to this Account!");
             }
-            if (!folderServerId.equals(messageReference.getFolderServerId())) {
+            if (folderId != messageReference.getFolderId()) {
                 throw new IllegalArgumentException("all message references must belong to this LocalFolder!");
             }
 
@@ -865,11 +833,11 @@ public class LocalFolder {
         return messages;
     }
 
-    public Map<String, String> copyMessages(List<? extends Message> msgs, LocalFolder folder) throws MessagingException {
+    public Map<String, String> copyMessages(List<LocalMessage> msgs, LocalFolder folder) throws MessagingException {
         return folder.appendMessages(msgs, true);
     }
 
-    public Map<String, String> moveMessages(final List<? extends Message> msgs, final LocalFolder destFolder) throws MessagingException {
+    public Map<String, String> moveMessages(final List<LocalMessage> msgs, final LocalFolder destFolder) throws MessagingException {
         final Map<String, String> uidMap = new HashMap<>();
 
         try {
@@ -878,17 +846,15 @@ public class LocalFolder {
                 public Void doDbWork(final SQLiteDatabase db) throws WrappedException, UnavailableStorageException {
                     try {
                         destFolder.open();
-                        for (Message message : msgs) {
-                            LocalMessage lMessage = (LocalMessage)message;
-
+                        for (LocalMessage message : msgs) {
                             String oldUID = message.getUid();
 
                             Timber.d("Updating folder_id to %s for message with UID %s, " +
                                     "id %d currently in folder %s",
                                     destFolder.getDatabaseId(),
                                     message.getUid(),
-                                    lMessage.getDatabaseId(),
-                                    getServerId());
+                                    message.getDatabaseId(),
+                                    getName());
 
                             String newUid = K9.LOCAL_UID_PREFIX + UUID.randomUUID().toString();
                             message.setUid(newUid);
@@ -901,7 +867,7 @@ public class LocalFolder {
                             /*
                              * "Move" the message into the new folder
                              */
-                            long msgId = lMessage.getDatabaseId();
+                            long msgId = message.getDatabaseId();
                             String[] idArg = new String[] { Long.toString(msgId) };
 
                             ContentValues cv = new ContentValues();
@@ -972,7 +938,7 @@ public class LocalFolder {
                             cv.clear();
                             cv.put("message_id", newId);
                             db.update("threads", cv, "id = ?",
-                                    new String[] { Long.toString(lMessage.getThreadId()) });
+                                    new String[] { Long.toString(message.getThreadId()) });
                         }
                     } catch (MessagingException e) {
                         throw new WrappedException(e);
@@ -1001,16 +967,16 @@ public class LocalFolder {
      * fact, in most cases, they are not). Therefore, if you want to make local changes only to a
      * message, retrieve the appropriate local message instance first (if it already exists).
      */
-    public Map<String, String> appendMessages(List<? extends Message> messages) throws MessagingException {
+    public Map<String, String> appendMessages(List<Message> messages) throws MessagingException {
         return appendMessages(messages, false);
     }
 
-    public void destroyMessages(final List<? extends Message> messages) {
+    public void destroyMessages(final List<LocalMessage> messages) {
         try {
             this.localStore.getDatabase().execute(true, new DbCallback<Void>() {
                 @Override
                 public Void doDbWork(final SQLiteDatabase db) throws WrappedException, UnavailableStorageException {
-                    for (Message message : messages) {
+                    for (LocalMessage message : messages) {
                         try {
                             message.destroy();
                         } catch (MessagingException e) {
@@ -1534,7 +1500,7 @@ public class LocalFolder {
         this.localStore.notifyChange();
     }
 
-    public void setFlags(final List<? extends Message> messages, final Set<Flag> flags, final boolean value)
+    public void setFlags(final List<LocalMessage> messages, final Set<Flag> flags, final boolean value)
     throws MessagingException {
         open();
 
@@ -1545,7 +1511,7 @@ public class LocalFolder {
                 public Void doDbWork(final SQLiteDatabase db) throws WrappedException,
                         UnavailableStorageException {
 
-                    for (Message message : messages) {
+                    for (LocalMessage message : messages) {
                         try {
                             message.setFlags(flags, value);
                         } catch (MessagingException e) {
@@ -1564,7 +1530,7 @@ public class LocalFolder {
     public void setFlags(final Set<Flag> flags, boolean value)
     throws MessagingException {
         open();
-        for (Message message : getMessages(null)) {
+        for (LocalMessage message : getMessages(null)) {
             message.setFlags(flags, value);
         }
     }
@@ -1613,6 +1579,39 @@ public class LocalFolder {
         setVisibleLimit(getAccount().getDisplayCount());
     }
 
+    public void destroyLocalOnlyMessages() throws MessagingException {
+        destroyMessages("uid LIKE '" + K9.LOCAL_UID_PREFIX + "%'");
+    }
+
+    public void destroyDeletedMessages() throws MessagingException {
+        destroyMessages("empty = 0 AND deleted = 1");
+    }
+
+    private void destroyMessages(String messageSelection) throws MessagingException {
+        localStore.getDatabase().execute(false, (DbCallback<Void>) db -> {
+            try (Cursor cursor = db.query(
+                    "messages",
+                    new String[] { "id", "message_part_id", "message_id" },
+                    "folder_id = ? AND " + messageSelection,
+                    new String[] { Long.toString(databaseId) },
+                    null,
+                    null,
+                    null)
+            ) {
+                while (cursor.moveToNext()) {
+                    long messageId = cursor.getLong(0);
+                    long messagePartId = cursor.getLong(1);
+                    String messageIdHeader = cursor.getString(2);
+                    destroyMessage(messageId, messagePartId, messageIdHeader);
+                }
+            }
+
+            compactFulltextEntries(db);
+
+            return null;
+        });
+    }
+
     public void delete() throws MessagingException {
         try {
             this.localStore.getDatabase().execute(false, new DbCallback<Void>() {
@@ -1641,14 +1640,15 @@ public class LocalFolder {
     @Override
     public boolean equals(Object o) {
         if (o instanceof LocalFolder) {
-            return ((LocalFolder)o).serverId.equals(serverId);
+            return ((LocalFolder)o).databaseId == databaseId;
         }
         return super.equals(o);
     }
 
     @Override
     public int hashCode() {
-        return serverId.hashCode();
+        long value = databaseId;
+        return (int) (value ^ (value >>> 32));
     }
 
     void destroyMessage(LocalMessage localMessage) throws MessagingException {
@@ -1795,6 +1795,10 @@ public class LocalFolder {
     void deleteFulltextIndexEntry(SQLiteDatabase db, long messageId) {
         String[] idArg = { Long.toString(messageId) };
         db.delete("messages_fulltext", "docid = ?", idArg);
+    }
+
+    void compactFulltextEntries(SQLiteDatabase db) {
+        db.execSQL("INSERT INTO messages_fulltext(messages_fulltext) VALUES('optimize')");
     }
 
     void deleteMessagePartsAndDataFromDisk(final long rootMessagePartId) throws MessagingException {

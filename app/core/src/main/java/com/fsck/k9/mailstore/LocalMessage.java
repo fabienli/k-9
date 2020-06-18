@@ -307,7 +307,11 @@ public class LocalMessage extends MimeMessage {
                 public Void doDbWork(final SQLiteDatabase db) throws WrappedException, UnavailableStorageException {
                     ContentValues cv = new ContentValues();
                     cv.put("deleted", 1);
-                    cv.put("empty", 1);
+                    cv.put("preview_type", DatabasePreviewType.fromPreviewType(PreviewType.NONE).getDatabaseValue());
+                    cv.put("read", 0);
+                    cv.put("flagged", 0);
+                    cv.put("answered", 0);
+                    cv.put("forwarded", 0);
                     cv.putNull("subject");
                     cv.putNull("sender_list");
                     cv.putNull("date");
@@ -317,6 +321,11 @@ public class LocalMessage extends MimeMessage {
                     cv.putNull("preview");
                     cv.putNull("reply_to_list");
                     cv.putNull("message_part_id");
+                    cv.putNull("flags");
+                    cv.putNull("attachment_count");
+                    cv.putNull("internal_date");
+                    cv.putNull("mime_type");
+                    cv.putNull("encryption_type");
 
                     db.update("messages", cv, "id = ?", new String[] { Long.toString(databaseId) });
 
@@ -395,7 +404,9 @@ public class LocalMessage extends MimeMessage {
 
     public MessageReference makeMessageReference() {
         if (messageReference == null) {
-            messageReference = new MessageReference(getFolder().getAccountUuid(), getFolder().getServerId(), mUid, null);
+            String accountUuid = getFolder().getAccountUuid();
+            long folderId = getFolder().getDatabaseId();
+            messageReference = new MessageReference(accountUuid, folderId, mUid, null);
         }
         return messageReference;
     }
@@ -405,7 +416,7 @@ public class LocalMessage extends MimeMessage {
     }
 
     public String getUri() {
-        return "email://messages/" +  getAccount().getAccountNumber() + "/" + getFolder().getServerId() + "/" + getUid();
+        return "k9mail://messages/" +  getAccount().getAccountNumber() + "/" + getFolder().getDatabaseId() + "/" + getUid();
     }
 
     @Override

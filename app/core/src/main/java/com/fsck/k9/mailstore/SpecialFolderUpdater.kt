@@ -9,6 +9,7 @@ import com.fsck.k9.mail.FolderClass
  * Updates special folders in [Account] if they are marked as [SpecialFolderSelection.AUTOMATIC] or if they are marked
  * as [SpecialFolderSelection.MANUAL] but have been deleted from the server.
  */
+// TODO: Find a better way to deal with local-only special folders
 class SpecialFolderUpdater(
     private val preferences: Preferences,
     private val folderRepository: FolderRepository,
@@ -19,42 +20,55 @@ class SpecialFolderUpdater(
         val folders = folderRepository.getRemoteFolders()
 
         updateInbox(folders)
-        updateSpecialFolder(FolderType.ARCHIVE, folders)
-        updateSpecialFolder(FolderType.DRAFTS, folders)
-        updateSpecialFolder(FolderType.SENT, folders)
-        updateSpecialFolder(FolderType.SPAM, folders)
-        updateSpecialFolder(FolderType.TRASH, folders)
 
+        if (!account.isPop3()) {
+            updateSpecialFolder(FolderType.ARCHIVE, folders)
+            updateSpecialFolder(FolderType.DRAFTS, folders)
+            updateSpecialFolder(FolderType.SENT, folders)
+            updateSpecialFolder(FolderType.SPAM, folders)
+            updateSpecialFolder(FolderType.TRASH, folders)
+        }
+
+        removeImportedSpecialFoldersData()
         saveAccount()
     }
 
-    private fun updateInbox(folders: List<Folder>) {
-        val oldInboxServerId = account.inboxFolder
-        val newInboxServerId = folders.firstOrNull { it.type == FolderType.INBOX }?.serverId
-        if (newInboxServerId == oldInboxServerId) return
+    private fun updateInbox(folders: List<RemoteFolder>) {
+        val oldInboxId = account.inboxFolderId
+        val newInboxId = folders.firstOrNull { it.type == FolderType.INBOX }?.id
+        if (newInboxId == oldInboxId) return
 
-        account.inboxFolder = newInboxServerId
+        account.inboxFolderId = newInboxId
 
-        if (oldInboxServerId != null && folders.any { it.serverId == oldInboxServerId }) {
-            folderRepository.setIncludeInUnifiedInbox(oldInboxServerId, false)
+        if (oldInboxId != null && folders.any { it.id == oldInboxId }) {
+            folderRepository.setIncludeInUnifiedInbox(oldInboxId, false)
         }
 
-        if (newInboxServerId != null) {
-            folderRepository.setIncludeInUnifiedInbox(newInboxServerId, true)
-            folderRepository.setDisplayClass(newInboxServerId, FolderClass.FIRST_CLASS)
-            folderRepository.setSyncClass(newInboxServerId, FolderClass.FIRST_CLASS)
-            folderRepository.setNotificationClass(newInboxServerId, FolderClass.FIRST_CLASS)
+        if (newInboxId != null) {
+            folderRepository.setIncludeInUnifiedInbox(newInboxId, true)
+            folderRepository.setDisplayClass(newInboxId, FolderClass.FIRST_CLASS)
+            folderRepository.setSyncClass(newInboxId, FolderClass.FIRST_CLASS)
+            folderRepository.setNotificationClass(newInboxId, FolderClass.FIRST_CLASS)
         }
     }
 
-    private fun updateSpecialFolder(type: FolderType, folders: List<Folder>) {
+    private fun updateSpecialFolder(type: FolderType, folders: List<RemoteFolder>) {
+        val importedServerId = getImportedSpecialFolderServerId(type)
+        if (importedServerId != null) {
+            val folderId = folders.firstOrNull { it.serverId == importedServerId }?.id
+            if (folderId != null) {
+                setSpecialFolder(type, folderId, getSpecialFolderSelection(type))
+                return
+            }
+        }
+
         when (getSpecialFolderSelection(type)) {
             SpecialFolderSelection.AUTOMATIC -> {
                 val specialFolder = specialFolderSelectionStrategy.selectSpecialFolder(folders, type)
-                setSpecialFolder(type, specialFolder?.serverId, SpecialFolderSelection.AUTOMATIC)
+                setSpecialFolder(type, specialFolder?.id, SpecialFolderSelection.AUTOMATIC)
             }
             SpecialFolderSelection.MANUAL -> {
-                if (folders.none { it.serverId == getSpecialFolder(type) }) {
+                if (folders.none { it.id == getSpecialFolderId(type) }) {
                     setSpecialFolder(type, null, SpecialFolderSelection.MANUAL)
                 }
             }
@@ -70,34 +84,53 @@ class SpecialFolderUpdater(
         else -> throw AssertionError("Unsupported: $type")
     }
 
-    private fun getSpecialFolder(type: FolderType): String? = when (type) {
-        FolderType.ARCHIVE -> account.archiveFolder
-        FolderType.DRAFTS -> account.draftsFolder
-        FolderType.SENT -> account.sentFolder
-        FolderType.SPAM -> account.spamFolder
-        FolderType.TRASH -> account.trashFolder
+    private fun getSpecialFolderId(type: FolderType): Long? = when (type) {
+        FolderType.ARCHIVE -> account.archiveFolderId
+        FolderType.DRAFTS -> account.draftsFolderId
+        FolderType.SENT -> account.sentFolderId
+        FolderType.SPAM -> account.spamFolderId
+        FolderType.TRASH -> account.trashFolderId
         else -> throw AssertionError("Unsupported: $type")
     }
 
-    private fun setSpecialFolder(type: FolderType, folder: String?, selection: SpecialFolderSelection) {
-        if (getSpecialFolder(type) == folder) return
+    private fun getImportedSpecialFolderServerId(type: FolderType): String? = when (type) {
+        FolderType.ARCHIVE -> account.importedArchiveFolder
+        FolderType.DRAFTS -> account.importedDraftsFolder
+        FolderType.SENT -> account.importedSentFolder
+        FolderType.SPAM -> account.importedSpamFolder
+        FolderType.TRASH -> account.importedTrashFolder
+        else -> throw AssertionError("Unsupported: $type")
+    }
+
+    private fun setSpecialFolder(type: FolderType, folderId: Long?, selection: SpecialFolderSelection) {
+        if (getSpecialFolderId(type) == folderId) return
 
         when (type) {
-            FolderType.ARCHIVE -> account.setArchiveFolder(folder, selection)
-            FolderType.DRAFTS -> account.setDraftsFolder(folder, selection)
-            FolderType.SENT -> account.setSentFolder(folder, selection)
-            FolderType.SPAM -> account.setSpamFolder(folder, selection)
-            FolderType.TRASH -> account.setTrashFolder(folder, selection)
+            FolderType.ARCHIVE -> account.setArchiveFolderId(folderId, selection)
+            FolderType.DRAFTS -> account.setDraftsFolderId(folderId, selection)
+            FolderType.SENT -> account.setSentFolderId(folderId, selection)
+            FolderType.SPAM -> account.setSpamFolderId(folderId, selection)
+            FolderType.TRASH -> account.setTrashFolderId(folderId, selection)
             else -> throw AssertionError("Unsupported: $type")
         }
 
-        if (folder != null) {
-            folderRepository.setDisplayClass(folder, FolderClass.FIRST_CLASS)
-            folderRepository.setSyncClass(folder, FolderClass.NO_CLASS)
+        if (folderId != null) {
+            folderRepository.setDisplayClass(folderId, FolderClass.FIRST_CLASS)
+            folderRepository.setSyncClass(folderId, FolderClass.NO_CLASS)
         }
+    }
+
+    private fun removeImportedSpecialFoldersData() {
+        account.importedArchiveFolder = null
+        account.importedDraftsFolder = null
+        account.importedSentFolder = null
+        account.importedSpamFolder = null
+        account.importedTrashFolder = null
     }
 
     private fun saveAccount() {
         preferences.saveAccount(account)
     }
+
+    private fun Account.isPop3() = storeUri.startsWith("pop3")
 }

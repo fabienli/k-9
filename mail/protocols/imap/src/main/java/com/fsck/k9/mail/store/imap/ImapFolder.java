@@ -345,7 +345,7 @@ public class ImapFolder {
      *
      * <p>
      * <strong>Note:</strong>
-     * Only the UIDs of the given {@link Message} instances are used. It is assumed that all
+     * Only the UIDs of the given {@link ImapMessage} instances are used. It is assumed that all
      * UIDs represent valid messages in this folder.
      * </p>
      *
@@ -356,7 +356,7 @@ public class ImapFolder {
      *
      * @return The mapping of original message UIDs to the new server UIDs.
      */
-    public Map<String, String> copyMessages(List<? extends Message> messages, ImapFolder folder) throws MessagingException {
+    public Map<String, String> copyMessages(List<ImapMessage> messages, ImapFolder folder) throws MessagingException {
         if (messages.isEmpty()) {
             return null;
         }
@@ -392,7 +392,7 @@ public class ImapFolder {
         }
     }
 
-    public Map<String, String> moveMessages(List<? extends Message> messages, ImapFolder folder) throws MessagingException {
+    public Map<String, String> moveMessages(List<ImapMessage> messages, ImapFolder folder) throws MessagingException {
         if (messages.isEmpty()) {
             return null;
         }
@@ -607,7 +607,7 @@ public class ImapFolder {
     }
 
     public void fetch(List<ImapMessage> messages, FetchProfile fetchProfile,
-            MessageRetrievalListener<ImapMessage> listener) throws MessagingException {
+            MessageRetrievalListener<ImapMessage> listener, int maxDownloadSize) throws MessagingException {
         if (messages == null || messages.isEmpty()) {
             return;
         }
@@ -615,8 +615,8 @@ public class ImapFolder {
         checkOpen();
 
         List<String> uids = new ArrayList<>(messages.size());
-        HashMap<String, Message> messageMap = new HashMap<>();
-        for (Message message : messages) {
+        HashMap<String, ImapMessage> messageMap = new HashMap<>();
+        for (ImapMessage message : messages) {
             String uid = message.getUid();
             uids.add(uid);
             messageMap.put(uid, message);
@@ -641,9 +641,8 @@ public class ImapFolder {
         }
 
         if (fetchProfile.contains(FetchProfile.Item.BODY_SANE)) {
-            int maximumAutoDownloadMessageSize = store.getStoreConfig().getMaximumAutoDownloadMessageSize();
-            if (maximumAutoDownloadMessageSize > 0) {
-                fetchFields.add(String.format(Locale.US, "BODY.PEEK[]<0.%d>", maximumAutoDownloadMessageSize));
+            if (maxDownloadSize > 0) {
+                fetchFields.add(String.format(Locale.US, "BODY.PEEK[]<0.%d>", maxDownloadSize));
             } else {
                 fetchFields.add("BODY.PEEK[]");
             }
@@ -691,7 +690,7 @@ public class ImapFolder {
                             }
                         }
 
-                        Message message = messageMap.get(uid);
+                        ImapMessage message = messageMap.get(uid);
                         if (message == null) {
                             if (K9MailLib.isDebug()) {
                                 Timber.d("Do not have message in messageMap for UID %s for %s", uid, getLogId());
@@ -705,14 +704,13 @@ public class ImapFolder {
                             listener.messageStarted(uid, messageNumber++, messageMap.size());
                         }
 
-                        ImapMessage imapMessage = (ImapMessage) message;
-                        Object literal = handleFetchResponse(imapMessage, fetchList);
+                        Object literal = handleFetchResponse(message, fetchList);
 
                         if (literal != null) {
                             if (literal instanceof String) {
                                 String bodyString = (String) literal;
                                 InputStream bodyStream = new ByteArrayInputStream(bodyString.getBytes());
-                                imapMessage.parse(bodyStream);
+                                message.parse(bodyStream);
                             } else if (literal instanceof Integer) {
                                 // All the work was done in FetchBodyCallback.foundLiteral()
                             } else {
@@ -722,7 +720,7 @@ public class ImapFolder {
                         }
 
                         if (listener != null) {
-                            listener.messageFinished(imapMessage, messageNumber, messageMap.size());
+                            listener.messageFinished(message, messageNumber, messageMap.size());
                         }
                     } else {
                         handleUntaggedResponse(response);
@@ -735,16 +733,15 @@ public class ImapFolder {
         }
     }
 
-    public void fetchPart(Message message, Part part, MessageRetrievalListener<Message> listener,
-            BodyFactory bodyFactory) throws MessagingException {
+    public void fetchPart(ImapMessage message, Part part, MessageRetrievalListener<ImapMessage> listener,
+            BodyFactory bodyFactory, int maxDownloadSize) throws MessagingException {
         checkOpen();
 
         String partId = part.getServerExtra();
 
         String fetch;
         if ("TEXT".equalsIgnoreCase(partId)) {
-            int maximumAutoDownloadMessageSize = store.getStoreConfig().getMaximumAutoDownloadMessageSize();
-            fetch = String.format(Locale.US, "BODY.PEEK[TEXT]<0.%d>", maximumAutoDownloadMessageSize);
+            fetch = String.format(Locale.US, "BODY.PEEK[TEXT]<0.%d>", maxDownloadSize);
         } else {
             fetch = String.format("BODY.PEEK[%s]", partId);
         }
@@ -778,9 +775,7 @@ public class ImapFolder {
                         listener.messageStarted(uid, messageNumber++, 1);
                     }
 
-                    ImapMessage imapMessage = (ImapMessage) message;
-
-                    Object literal = handleFetchResponse(imapMessage, fetchList);
+                    Object literal = handleFetchResponse(message, fetchList);
 
                     if (literal != null) {
                         if (literal instanceof Body) {
@@ -1098,7 +1093,7 @@ public class ImapFolder {
      *
      * @return The mapping of original message UIDs to the new server UIDs.
      */
-    public Map<String, String> appendMessages(List<? extends Message> messages) throws MessagingException {
+    public Map<String, String> appendMessages(List<Message> messages) throws MessagingException {
         open(OPEN_MODE_RW);
         checkOpen();
 
@@ -1261,13 +1256,13 @@ public class ImapFolder {
         }
     }
 
-    public void setFlags(List<? extends Message> messages, final Set<Flag> flags, boolean value)
+    public void setFlags(List<ImapMessage> messages, final Set<Flag> flags, boolean value)
             throws MessagingException {
         open(OPEN_MODE_RW);
         checkOpen();
 
         Set<Long> uids = new HashSet<>(messages.size());
-        for (Message message : messages) {
+        for (ImapMessage message : messages) {
             uids.add(Long.parseLong(message.getUid()));
         }
 
@@ -1318,7 +1313,7 @@ public class ImapFolder {
     }
 
     protected String getLogId() {
-        String id = store.getStoreConfig().toString() + ":" + getServerId() + "/" + Thread.currentThread().getName();
+        String id = store.getLogLabel() + ":" + getServerId() + "/" + Thread.currentThread().getName();
         if (connection != null) {
             id += "/" + connection.getLogId();
         }
@@ -1335,11 +1330,7 @@ public class ImapFolder {
      * @throws MessagingException On any error.
      */
     public List<ImapMessage> search(final String queryString, final Set<Flag> requiredFlags,
-            final Set<Flag> forbiddenFlags) throws MessagingException {
-
-        if (!store.getStoreConfig().isAllowRemoteSearch()) {
-            throw new MessagingException("Your settings do not allow remote searching of this account");
-        }
+            final Set<Flag> forbiddenFlags, boolean performFullTextSearch) throws MessagingException {
 
         try {
             open(OPEN_MODE_RO);
@@ -1349,7 +1340,7 @@ public class ImapFolder {
 
             String searchCommand = new UidSearchCommandBuilder()
                     .queryString(queryString)
-                    .performFullTextSearch(store.getStoreConfig().isRemoteSearchFullText())
+                    .performFullTextSearch(performFullTextSearch)
                     .requiredFlags(requiredFlags)
                     .forbiddenFlags(forbiddenFlags)
                     .build();

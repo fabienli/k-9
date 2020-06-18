@@ -40,6 +40,7 @@ import com.fsck.k9.K9.Intents;
 import com.fsck.k9.Preferences;
 import com.fsck.k9.backend.BackendManager;
 import com.fsck.k9.backend.api.Backend;
+import com.fsck.k9.backend.api.BuildConfig;
 import com.fsck.k9.backend.api.SyncConfig;
 import com.fsck.k9.backend.api.SyncListener;
 import com.fsck.k9.cache.EmailProviderCache;
@@ -55,6 +56,7 @@ import com.fsck.k9.controller.MessagingControllerCommands.PendingMoveOrCopy;
 import com.fsck.k9.controller.MessagingControllerCommands.PendingSetFlag;
 import com.fsck.k9.controller.ProgressBodyFactory.ProgressListener;
 import com.fsck.k9.helper.Contacts;
+import com.fsck.k9.helper.MutableBoolean;
 import com.fsck.k9.mail.Address;
 import com.fsck.k9.mail.AuthenticationFailedException;
 import com.fsck.k9.mail.CertificateValidationException;
@@ -89,6 +91,7 @@ import timber.log.Timber;
 
 import static com.fsck.k9.K9.MAX_SEND_ATTEMPTS;
 import static com.fsck.k9.helper.ExceptionHelper.getRootCauseMessage;
+import static com.fsck.k9.helper.Preconditions.checkNotNull;
 import static com.fsck.k9.mail.Flag.X_REMOTE_COPY_STARTED;
 import static com.fsck.k9.search.LocalSearchExtensions.getAccountsFromLocalSearch;
 
@@ -278,6 +281,25 @@ public class MessagingController {
         }
     }
 
+    private String getFolderServerId(Account account, long folderId) throws MessagingException {
+        LocalStore localStore = getLocalStoreOrThrow(account);
+        return localStore.getFolderServerId(folderId);
+    }
+
+    private long getFolderId(Account account, String folderServerId) throws MessagingException {
+        LocalStore localStore = getLocalStoreOrThrow(account);
+        return localStore.getFolderId(folderServerId);
+    }
+
+    private long getFolderIdOrThrow(Account account, String folderServerId) {
+        LocalStore localStore = getLocalStoreOrThrow(account);
+        try {
+            return localStore.getFolderId(folderServerId);
+        } catch (MessagingException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     public void addListener(MessagingListener listener) {
         listeners.add(listener);
         refreshListener(listener);
@@ -315,7 +337,7 @@ public class MessagingController {
         cache.hideMessages(messages);
     }
 
-    private void unsuppressMessages(Account account, List<? extends Message> messages) {
+    private void unsuppressMessages(Account account, List<LocalMessage> messages) {
         EmailProviderCache cache = EmailProviderCache.getCache(account.getUuid(), context);
         cache.unhideMessages(messages);
     }
@@ -431,40 +453,42 @@ public class MessagingController {
         }
     }
 
-    public Future<?> searchRemoteMessages(final String acctUuid, final String folderServerId, final String query,
-            final Set<Flag> requiredFlags, final Set<Flag> forbiddenFlags, final MessagingListener listener) {
-        Timber.i("searchRemoteMessages (acct = %s, folderServerId = %s, query = %s)", acctUuid, folderServerId, query);
+    public Future<?> searchRemoteMessages(String acctUuid, long folderId, String query, Set<Flag> requiredFlags,
+            Set<Flag> forbiddenFlags, MessagingListener listener) {
+        Timber.i("searchRemoteMessages (acct = %s, folderId = %d, query = %s)", acctUuid, folderId, query);
 
-        return threadPool.submit(new Runnable() {
-            @Override
-            public void run() {
-                searchRemoteMessagesSynchronous(acctUuid, folderServerId, query, requiredFlags, forbiddenFlags,
-                        listener);
-            }
-        });
+        return threadPool.submit(() ->
+                searchRemoteMessagesSynchronous(acctUuid, folderId, query, requiredFlags, forbiddenFlags, listener)
+        );
     }
 
     @VisibleForTesting
-    void searchRemoteMessagesSynchronous(final String acctUuid, final String folderServerId, final String query,
-            final Set<Flag> requiredFlags, final Set<Flag> forbiddenFlags, final MessagingListener listener) {
-        final Account acct = Preferences.getPreferences(context).getAccount(acctUuid);
+    void searchRemoteMessagesSynchronous(String acctUuid, long folderId, String query, Set<Flag> requiredFlags,
+            Set<Flag> forbiddenFlags, MessagingListener listener) {
+
+        Account account = Preferences.getPreferences(context).getAccount(acctUuid);
 
         if (listener != null) {
-            listener.remoteSearchStarted(folderServerId);
+            listener.remoteSearchStarted(folderId);
         }
 
         List<String> extraResults = new ArrayList<>();
         try {
-            LocalStore localStore = localStoreProvider.getInstance(acct);
+            LocalStore localStore = localStoreProvider.getInstance(account);
 
-            LocalFolder localFolder = localStore.getFolder(folderServerId);
-            if (localFolder == null) {
+            LocalFolder localFolder = localStore.getFolder(folderId);
+            if (!localFolder.exists()) {
                 throw new MessagingException("Folder not found");
             }
 
-            Backend backend = getBackend(acct);
+            localFolder.open();
+            String folderServerId = localFolder.getServerId();
 
-            List<String> messageServerIds = backend.search(folderServerId, query, requiredFlags, forbiddenFlags);
+            Backend backend = getBackend(account);
+
+            boolean performFullTextSearch = account.isRemoteSearchFullText();
+            List<String> messageServerIds = backend.search(folderServerId, query, requiredFlags, forbiddenFlags,
+                    performFullTextSearch);
 
             Timber.i("Remote search got %d results", messageServerIds.size());
 
@@ -472,17 +496,17 @@ public class MessagingController {
             messageServerIds = localFolder.extractNewMessages(messageServerIds);
 
             if (listener != null) {
-                listener.remoteSearchServerQueryComplete(folderServerId, messageServerIds.size(),
-                        acct.getRemoteSearchNumResults());
+                listener.remoteSearchServerQueryComplete(folderId, messageServerIds.size(),
+                        account.getRemoteSearchNumResults());
             }
 
-            int resultLimit = acct.getRemoteSearchNumResults();
+            int resultLimit = account.getRemoteSearchNumResults();
             if (resultLimit > 0 && messageServerIds.size() > resultLimit) {
                 extraResults = messageServerIds.subList(resultLimit, messageServerIds.size());
                 messageServerIds = messageServerIds.subList(0, resultLimit);
             }
 
-            loadSearchResultsSynchronous(acct, messageServerIds, localFolder);
+            loadSearchResultsSynchronous(account, messageServerIds, localFolder);
         } catch (Exception e) {
             if (Thread.currentThread().isInterrupted()) {
                 Timber.i(e, "Caught exception on aborted remote search; safe to ignore.");
@@ -495,39 +519,34 @@ public class MessagingController {
             }
         } finally {
             if (listener != null) {
-                listener.remoteSearchFinished(folderServerId, 0, acct.getRemoteSearchNumResults(), extraResults);
+                listener.remoteSearchFinished(folderId, 0, account.getRemoteSearchNumResults(), extraResults);
             }
         }
 
     }
 
-    public void loadSearchResults(final Account account, final String folderServerId,
-            final List<String> messageServerIds, final MessagingListener listener) {
-        threadPool.execute(new Runnable() {
-            @Override
-            public void run() {
-                if (listener != null) {
-                    listener.enableProgressIndicator(true);
+    public void loadSearchResults(Account account, long folderId, List<String> messageServerIds,
+            MessagingListener listener) {
+        threadPool.execute(() -> {
+            if (listener != null) {
+                listener.enableProgressIndicator(true);
+            }
+
+            try {
+                LocalStore localStore = localStoreProvider.getInstance(account);
+                LocalFolder localFolder = localStore.getFolder(folderId);
+                if (!localFolder.exists()) {
+                    throw new MessagingException("Folder not found");
                 }
-                try {
-                    LocalStore localStore = localStoreProvider.getInstance(account);
 
-                    if (localStore == null) {
-                        throw new MessagingException("Could not get store");
-                    }
+                localFolder.open();
 
-                    LocalFolder localFolder = localStore.getFolder(folderServerId);
-                    if (localFolder == null) {
-                        throw new MessagingException("Folder not found");
-                    }
-
-                    loadSearchResultsSynchronous(account, messageServerIds, localFolder);
-                } catch (MessagingException e) {
-                    Timber.e(e, "Exception in loadSearchResults");
-                } finally {
-                    if (listener != null) {
-                        listener.enableProgressIndicator(false);
-                    }
+                loadSearchResultsSynchronous(account, messageServerIds, localFolder);
+            } catch (MessagingException e) {
+                Timber.e(e, "Exception in loadSearchResults");
+            } finally {
+                if (listener != null) {
+                    listener.enableProgressIndicator(false);
                 }
             }
         });
@@ -548,21 +567,22 @@ public class MessagingController {
             LocalMessage localMessage = localFolder.getMessage(messageServerId);
 
             if (localMessage == null) {
-                Message message = backend.fetchMessage(folderServerId, messageServerId, fetchProfile);
+                int maxDownloadSize = account.getMaximumAutoDownloadMessageSize();
+                Message message = backend.fetchMessage(folderServerId, messageServerId, fetchProfile, maxDownloadSize);
                 localFolder.appendMessages(Collections.singletonList(message));
             }
         }
     }
 
 
-    public void loadMoreMessages(Account account, String folder, MessagingListener listener) {
+    public void loadMoreMessages(Account account, long folderId, MessagingListener listener) {
         try {
             LocalStore localStore = localStoreProvider.getInstance(account);
-            LocalFolder localFolder = localStore.getFolder(folder);
+            LocalFolder localFolder = localStore.getFolder(folderId);
             if (localFolder.getVisibleLimit() > 0) {
                 localFolder.setVisibleLimit(localFolder.getVisibleLimit() + account.getDisplayCount());
             }
-            synchronizeMailbox(account, folder, listener);
+            synchronizeMailbox(account, folderId, listener);
         } catch (MessagingException me) {
             throw new RuntimeException("Unable to set visible limit on folder", me);
         }
@@ -571,13 +591,10 @@ public class MessagingController {
     /**
      * Start background synchronization of the specified folder.
      */
-    public void synchronizeMailbox(final Account account, final String folder, final MessagingListener listener) {
-        putBackground("synchronizeMailbox", listener, new Runnable() {
-            @Override
-            public void run() {
-                synchronizeMailboxSynchronous(account, folder, listener);
-            }
-        });
+    public void synchronizeMailbox(Account account, long folderId, MessagingListener listener) {
+        putBackground("synchronizeMailbox", listener, () ->
+                synchronizeMailboxSynchronous(account, folderId, listener)
+        );
     }
 
     /**
@@ -587,12 +604,12 @@ public class MessagingController {
      * TODO Break this method up into smaller chunks.
      */
     @VisibleForTesting
-    void synchronizeMailboxSynchronous(final Account account, final String folder, final MessagingListener listener) {
-        Backend remoteMessageStore = getBackend(account);
-        syncFolder(account, folder, listener, remoteMessageStore);
+    void synchronizeMailboxSynchronous(Account account, long folderId, MessagingListener listener) {
+        Backend backend = getBackend(account);
+        syncFolder(account, folderId, listener, backend);
     }
 
-    private void syncFolder(Account account, String folder, MessagingListener listener, Backend remoteMessageStore) {
+    private void syncFolder(Account account, long folderId, MessagingListener listener, Backend backend) {
         Exception commandException = null;
         try {
             processPendingCommandsSynchronous(account);
@@ -601,21 +618,32 @@ public class MessagingController {
             commandException = e;
         }
 
-        // We don't ever sync the Outbox
-        if (folder.equals(account.getOutboxFolder())) {
+        LocalFolder localFolder;
+        try {
+            LocalStore localStore = localStoreProvider.getInstance(account);
+            localFolder = localStore.getFolder(folderId);
+            localFolder.open();
+        } catch (MessagingException e) {
+            Timber.e(e, "syncFolder: Couldn't load local folder %d", folderId);
             return;
         }
 
-        SyncConfig syncConfig = createSyncConfig(account);
+        // We can't sync local folders
+        if (localFolder.isLocalOnly()) {
+            return;
+        }
 
+        String folderServerId = localFolder.getServerId();
+        SyncConfig syncConfig = createSyncConfig(account);
         ControllerSyncListener syncListener = new ControllerSyncListener(account, listener);
-        remoteMessageStore.sync(folder, syncConfig, syncListener);
+
+        backend.sync(folderServerId, syncConfig, syncListener);
 
         if (commandException != null && !syncListener.syncFailed) {
             String rootMessage = getRootCauseMessage(commandException);
-            Timber.e("Root cause failure in %s:%s was '%s'", account.getDescription(), folder, rootMessage);
-            updateFolderStatus(account, folder, rootMessage);
-            listener.synchronizeMailboxFailed(account, folder, rootMessage);
+            Timber.e("Root cause failure in %s:%s was '%s'", account.getDescription(), folderServerId, rootMessage);
+            updateFolderStatus(account, folderServerId, rootMessage);
+            listener.synchronizeMailboxFailed(account, folderId, rootMessage);
         }
     }
 
@@ -641,12 +669,6 @@ public class MessagingController {
 
     public void handleAuthenticationFailure(Account account, boolean incoming) {
         notificationController.showAuthenticationErrorNotification(account, incoming);
-    }
-
-    private static void closeFolder(LocalFolder f) {
-        if (f != null) {
-            f.close();
-        }
     }
 
     private void queuePendingCommand(Account account, PendingCommand command) {
@@ -723,95 +745,90 @@ public class MessagingController {
      * the local message. Once the local message is successfully processed it is deleted so
      * that the server message will be synchronized down without an additional copy being
      * created.
-     * TODO update the local message UID instead of deleting it
      */
     void processPendingAppend(PendingAppend command, Account account) throws MessagingException {
-        LocalFolder localFolder = null;
-        try {
+        LocalStore localStore = localStoreProvider.getInstance(account);
+        long folderId = command.folderId;
+        LocalFolder localFolder = localStore.getFolder(folderId);
+        localFolder.open();
 
-            String folder = command.folder;
-            String uid = command.uid;
+        String folderServerId = localFolder.getServerId();
+        String uid = command.uid;
 
-            LocalStore localStore = localStoreProvider.getInstance(account);
-            localFolder = localStore.getFolder(folder);
-            LocalMessage localMessage = localFolder.getMessage(uid);
+        LocalMessage localMessage = localFolder.getMessage(uid);
+        if (localMessage == null) {
+            return;
+        }
 
-            if (localMessage == null) {
-                return;
-            }
+        if (!localMessage.getUid().startsWith(K9.LOCAL_UID_PREFIX)) {
+            //FIXME: This should never happen. Throw in debug builds.
+            return;
+        }
 
-            if (!localMessage.getUid().startsWith(K9.LOCAL_UID_PREFIX)) {
-                //FIXME: This should never happen. Throw in debug builds.
-                return;
-            }
+        Backend backend = getBackend(account);
 
-            Backend backend = getBackend(account);
+        if (localMessage.isSet(Flag.X_REMOTE_COPY_STARTED)) {
+            Timber.w("Local message with uid %s has flag %s  already set, checking for remote message with " +
+                    "same message id", localMessage.getUid(), X_REMOTE_COPY_STARTED);
 
-            if (localMessage.isSet(Flag.X_REMOTE_COPY_STARTED)) {
-                Timber.w("Local message with uid %s has flag %s  already set, checking for remote message with " +
-                        "same message id", localMessage.getUid(), X_REMOTE_COPY_STARTED);
+            String messageServerId = backend.findByMessageId(folderServerId, localMessage.getMessageId());
+            if (messageServerId != null) {
+                Timber.w("Local message has flag %s already set, and there is a remote message with uid %s, " +
+                        "assuming message was already copied and aborting this copy",
+                        X_REMOTE_COPY_STARTED, messageServerId);
 
-                String messageServerId = backend.findByMessageId(folder, localMessage.getMessageId());
-                if (messageServerId != null) {
-                    Timber.w("Local message has flag %s already set, and there is a remote message with uid %s, " +
-                            "assuming message was already copied and aborting this copy",
-                            X_REMOTE_COPY_STARTED, messageServerId);
-
-                    String oldUid = localMessage.getUid();
-                    localMessage.setUid(messageServerId);
-                    localFolder.changeUid(localMessage);
-
-                    for (MessagingListener l : getListeners()) {
-                        l.messageUidChanged(account, folder, oldUid, localMessage.getUid());
-                    }
-
-                    return;
-                } else {
-                    Timber.w("No remote message with message-id found, proceeding with append");
-                }
-            }
-
-            /*
-             * If the message does not exist remotely we just upload it and then
-             * update our local copy with the new uid.
-             */
-            FetchProfile fp = new FetchProfile();
-            fp.add(FetchProfile.Item.BODY);
-            localFolder.fetch(Collections.singletonList(localMessage), fp, null);
-            String oldUid = localMessage.getUid();
-            localMessage.setFlag(Flag.X_REMOTE_COPY_STARTED, true);
-
-            String messageServerId = backend.uploadMessage(folder, localMessage);
-
-            if (messageServerId == null) {
-                // We didn't get the server UID of the uploaded message. Remove the local message now. The uploaded
-                // version will be downloaded during the next sync.
-                localFolder.destroyMessages(Collections.singletonList(localMessage));
-            } else {
+                String oldUid = localMessage.getUid();
                 localMessage.setUid(messageServerId);
                 localFolder.changeUid(localMessage);
 
                 for (MessagingListener l : getListeners()) {
-                    l.messageUidChanged(account, folder, oldUid, localMessage.getUid());
+                    l.messageUidChanged(account, folderId, oldUid, localMessage.getUid());
                 }
+
+                return;
+            } else {
+                Timber.w("No remote message with message-id found, proceeding with append");
             }
-        } finally {
-            closeFolder(localFolder);
+        }
+
+        /*
+         * If the message does not exist remotely we just upload it and then
+         * update our local copy with the new uid.
+         */
+        FetchProfile fp = new FetchProfile();
+        fp.add(FetchProfile.Item.BODY);
+        localFolder.fetch(Collections.singletonList(localMessage), fp, null);
+        String oldUid = localMessage.getUid();
+        localMessage.setFlag(Flag.X_REMOTE_COPY_STARTED, true);
+
+        String messageServerId = backend.uploadMessage(folderServerId, localMessage);
+
+        if (messageServerId == null) {
+            // We didn't get the server UID of the uploaded message. Remove the local message now. The uploaded
+            // version will be downloaded during the next sync.
+            localFolder.destroyMessages(Collections.singletonList(localMessage));
+        } else {
+            localMessage.setUid(messageServerId);
+            localFolder.changeUid(localMessage);
+
+            for (MessagingListener l : getListeners()) {
+                l.messageUidChanged(account, folderId, oldUid, localMessage.getUid());
+            }
         }
     }
 
-    private void queueMoveOrCopy(Account account, String srcFolder, String destFolder, MoveOrCopyFlavor operation,
+    private void queueMoveOrCopy(Account account, long srcFolderId, long destFolderId, MoveOrCopyFlavor operation,
             Map<String, String> uidMap) {
         PendingCommand command;
         switch (operation) {
             case MOVE:
-                command = PendingMoveOrCopy.create(srcFolder, destFolder, false, uidMap);
+                command = PendingMoveOrCopy.create(srcFolderId, destFolderId, false, uidMap);
                 break;
             case COPY:
-                command = PendingMoveOrCopy.create(srcFolder, destFolder, true, uidMap);
+                command = PendingMoveOrCopy.create(srcFolderId, destFolderId, true, uidMap);
                 break;
             case MOVE_AND_MARK_AS_READ:
-                command = PendingMoveAndMarkAsRead.create(srcFolder, destFolder, uidMap);
+                command = PendingMoveAndMarkAsRead.create(srcFolderId, destFolderId, uidMap);
                 break;
             default:
                 return;
@@ -820,8 +837,8 @@ public class MessagingController {
     }
 
     void processPendingMoveOrCopy(PendingMoveOrCopy command, Account account) throws MessagingException {
-        String srcFolder = command.srcFolder;
-        String destFolder = command.destFolder;
+        long srcFolder = command.srcFolderId;
+        long destFolder = command.destFolderId;
         MoveOrCopyFlavor operation = command.isCopy ? MoveOrCopyFlavor.COPY : MoveOrCopyFlavor.MOVE;
 
         Map<String, String> newUidMap = command.newUidMap;
@@ -831,8 +848,8 @@ public class MessagingController {
     }
 
     void processPendingMoveAndRead(PendingMoveAndMarkAsRead command, Account account) throws MessagingException {
-        String srcFolder = command.srcFolder;
-        String destFolder = command.destFolder;
+        long srcFolder = command.srcFolderId;
+        long destFolder = command.destFolderId;
         Map<String, String> newUidMap = command.newUidMap;
         List<String> uids = new ArrayList<>(newUidMap.keySet());
 
@@ -841,71 +858,101 @@ public class MessagingController {
     }
 
     @VisibleForTesting
-    void processPendingMoveOrCopy(Account account, String srcFolder, String destFolder, List<String> uids,
+    void processPendingMoveOrCopy(Account account, long srcFolderId, long destFolderId, List<String> uids,
                                   MoveOrCopyFlavor operation, Map<String, String> newUidMap) throws MessagingException {
-        LocalFolder localDestFolder;
+        checkNotNull(newUidMap);
 
         LocalStore localStore = localStoreProvider.getInstance(account);
-        localDestFolder = localStore.getFolder(destFolder);
+
+        LocalFolder localSourceFolder = localStore.getFolder(srcFolderId);
+        localSourceFolder.open();
+        String srcFolderServerId = localSourceFolder.getServerId();
+
+        LocalFolder localDestFolder = localStore.getFolder(destFolderId);
+        localDestFolder.open();
+        String destFolderServerId = localDestFolder.getServerId();
 
         Backend backend = getBackend(account);
 
         Map<String, String> remoteUidMap;
         switch (operation) {
             case COPY:
-                remoteUidMap = backend.copyMessages(srcFolder, destFolder, uids);
+                remoteUidMap = backend.copyMessages(srcFolderServerId, destFolderServerId, uids);
                 break;
             case MOVE:
-                remoteUidMap = backend.moveMessages(srcFolder, destFolder, uids);
+                remoteUidMap = backend.moveMessages(srcFolderServerId, destFolderServerId, uids);
                 break;
             case MOVE_AND_MARK_AS_READ:
-                remoteUidMap = backend.moveMessagesAndMarkAsRead(srcFolder, destFolder, uids);
+                remoteUidMap = backend.moveMessagesAndMarkAsRead(srcFolderServerId, destFolderServerId, uids);
                 break;
             default:
                 throw new RuntimeException("Unsupported messaging operation");
         }
 
-        if (operation != MoveOrCopyFlavor.COPY && backend.getSupportsExpunge()
-                && account.getExpungePolicy() == Expunge.EXPUNGE_IMMEDIATELY) {
-            Timber.i("processingPendingMoveOrCopy expunging folder %s:%s", account.getDescription(), srcFolder);
-            backend.expungeMessages(srcFolder, uids);
+        if (operation != MoveOrCopyFlavor.COPY) {
+            if (backend.getSupportsExpunge() && account.getExpungePolicy() == Expunge.EXPUNGE_IMMEDIATELY) {
+                Timber.i("processingPendingMoveOrCopy expunging folder %s:%s", account.getDescription(), srcFolderServerId);
+                backend.expungeMessages(srcFolderServerId, uids);
+            }
+
+            destroyPlaceholderMessages(localSourceFolder, uids);
         }
 
-        /*
-         * This next part is used to bring the local UIDs of the local destination folder
-         * upto speed with the remote UIDs of remote destination folder.
-         */
-        if (newUidMap != null && remoteUidMap != null && !remoteUidMap.isEmpty()) {
-            Timber.i("processingPendingMoveOrCopy: changing local uids of %d messages", remoteUidMap.size());
-            for (Entry<String, String> entry : remoteUidMap.entrySet()) {
-                String remoteSrcUid = entry.getKey();
-                String newUid = entry.getValue();
-                String localDestUid = newUidMap.get(remoteSrcUid);
-                if (localDestUid == null) {
-                    continue;
-                }
+        // TODO: Change Backend interface to ensure we never receive null for remoteUidMap
+        if (remoteUidMap == null) {
+            remoteUidMap = Collections.emptyMap();
+        }
 
-                Message localDestMessage = localDestFolder.getMessage(localDestUid);
-                if (localDestMessage != null) {
-                    localDestMessage.setUid(newUid);
-                    localDestFolder.changeUid((LocalMessage) localDestMessage);
-                    for (MessagingListener l : getListeners()) {
-                        l.messageUidChanged(account, destFolder, localDestUid, newUid);
-                    }
+        // Update local messages (that currently have local UIDs) with new server IDs
+        for (String uid : uids) {
+            String localUid = newUidMap.get(uid);
+            String newUid = remoteUidMap.get(uid);
+
+            LocalMessage localMessage = localDestFolder.getMessage(localUid);
+            if (localMessage == null) {
+                // Local message no longer exists
+                continue;
+            }
+
+            if (newUid != null) {
+                // Update local message with new server ID
+                localMessage.setUid(newUid);
+                localDestFolder.changeUid(localMessage);
+                for (MessagingListener l : getListeners()) {
+                    l.messageUidChanged(account, destFolderId, localUid, newUid);
+                }
+            } else {
+                // New server ID wasn't provided. Remove local message.
+                localMessage.destroy();
+            }
+        }
+    }
+
+    private void destroyPlaceholderMessages(LocalFolder localFolder, List<String> uids) throws MessagingException {
+        for (String uid : uids) {
+            LocalMessage placeholderMessage = localFolder.getMessage(uid);
+            if (placeholderMessage == null) {
+                continue;
+            }
+
+            if (placeholderMessage.isSet(Flag.DELETED)) {
+                placeholderMessage.destroy();
+            } else {
+                Timber.w("Expected local message %s in folder %s to be a placeholder, but DELETE flag wasn't set",
+                        uid, localFolder.getServerId());
+
+                if (BuildConfig.DEBUG) {
+                    throw new AssertionError("Placeholder message must have the DELETED flag set");
                 }
             }
         }
     }
 
-    private void queueSetFlag(final Account account, final String folderServerId,
-            final boolean newState, final Flag flag, final List<String> uids) {
-        putBackground("queueSetFlag " + account.getDescription() + ":" + folderServerId, null, new Runnable() {
-            @Override
-            public void run() {
-                PendingCommand command = PendingSetFlag.create(folderServerId, newState, flag, uids);
-                queuePendingCommand(account, command);
-                processPendingCommands(account);
-            }
+    private void queueSetFlag(Account account, long folderId, boolean newState, Flag flag, List<String> uids) {
+        putBackground("queueSetFlag", null, () -> {
+            PendingCommand command = PendingSetFlag.create(folderId, newState, flag, uids);
+            queuePendingCommand(account, command);
+            processPendingCommands(account);
         });
     }
 
@@ -914,72 +961,73 @@ public class MessagingController {
      */
     void processPendingSetFlag(PendingSetFlag command, Account account) throws MessagingException {
         Backend backend = getBackend(account);
-        backend.setFlag(command.folder, command.uids, command.flag, command.newState);
+        String folderServerId = getFolderServerId(account, command.folderId);
+        backend.setFlag(folderServerId, command.uids, command.flag, command.newState);
     }
 
-    private void queueDelete(final Account account, final String folderServerId, final List<String> uids) {
-        putBackground("queueDelete " + account.getDescription() + ":" + folderServerId, null, new Runnable() {
-            @Override
-            public void run() {
-                PendingCommand command = PendingDelete.create(folderServerId, uids);
-                queuePendingCommand(account, command);
-                processPendingCommands(account);
-            }
+    private void queueDelete(Account account, long folderId, List<String> uids) {
+        putBackground("queueDelete", null, () -> {
+            PendingCommand command = PendingDelete.create(folderId, uids);
+            queuePendingCommand(account, command);
+            processPendingCommands(account);
         });
     }
 
     void processPendingDelete(PendingDelete command, Account account) throws MessagingException {
+        long folderId = command.folderId;
+        List<String> uids = command.uids;
+
         Backend backend = getBackend(account);
-        backend.deleteMessages(command.folder, command.uids);
+        String folderServerId = getFolderServerId(account, folderId);
+        backend.deleteMessages(folderServerId, uids);
+
+        LocalStore localStore = localStoreProvider.getInstance(account);
+        LocalFolder localFolder = localStore.getFolder(folderId);
+        localFolder.open();
+        destroyPlaceholderMessages(localFolder, uids);
     }
 
-    private void queueExpunge(final Account account, final String folderServerId) {
-        putBackground("queueExpunge " + account.getDescription() + ":" + folderServerId, null, new Runnable() {
-            @Override
-            public void run() {
-                PendingCommand command = PendingExpunge.create(folderServerId);
-                queuePendingCommand(account, command);
-                processPendingCommands(account);
-            }
-        });
+    private void queueExpunge(Account account, long folderId) {
+        PendingCommand command = PendingExpunge.create(folderId);
+        queuePendingCommand(account, command);
     }
 
     void processPendingExpunge(PendingExpunge command, Account account) throws MessagingException {
         Backend backend = getBackend(account);
-        backend.expunge(command.folder);
+        String folderServerId = getFolderServerId(account, command.folderId);
+        backend.expunge(folderServerId);
     }
 
     void processPendingMarkAllAsRead(PendingMarkAllAsRead command, Account account) throws MessagingException {
-        String folder = command.folder;
-        LocalFolder localFolder = null;
-        try {
-            LocalStore localStore = localStoreProvider.getInstance(account);
-            localFolder = localStore.getFolder(folder);
-            localFolder.open();
-            List<? extends Message> messages = localFolder.getMessages(null, false);
-            for (Message message : messages) {
-                if (!message.isSet(Flag.SEEN)) {
-                    message.setFlag(Flag.SEEN, true);
-                }
-            }
+        long folderId = command.folderId;
+        LocalStore localStore = localStoreProvider.getInstance(account);
+        LocalFolder localFolder = localStore.getFolder(folderId);
 
-            for (MessagingListener l : getListeners()) {
-                l.folderStatusChanged(account, folder);
+        localFolder.open();
+        String folderServerId = localFolder.getServerId();
+
+        Timber.i("Marking all messages in %s:%s as read", account, folderServerId);
+
+        // TODO: Make this one database UPDATE operation
+        List<LocalMessage> messages = localFolder.getMessages(null, false);
+        for (Message message : messages) {
+            if (!message.isSet(Flag.SEEN)) {
+                message.setFlag(Flag.SEEN, true);
             }
-        } finally {
-            closeFolder(localFolder);
+        }
+
+        for (MessagingListener l : getListeners()) {
+            l.folderStatusChanged(account, folderId);
         }
 
         Backend backend = getBackend(account);
         if (backend.getSupportsSeenFlag()) {
-            backend.markAllAsRead(folder);
+            backend.markAllAsRead(folderServerId);
         }
     }
 
-    public void markAllMessagesRead(final Account account, final String folder) {
-        Timber.i("Marking all messages in %s:%s as read", account.getDescription(), folder);
-
-        PendingCommand command = PendingMarkAllAsRead.create(folder);
+    public void markAllMessagesRead(Account account, long folderId) {
+        PendingCommand command = PendingMarkAllAsRead.create(folderId);
         queuePendingCommand(account, command);
         processPendingCommands(account);
     }
@@ -1035,28 +1083,29 @@ public class MessagingController {
             Timber.e(e, "Couldn't set flags in local database");
         }
 
-        // Read folder name and UID of messages from the database
-        Map<String, List<String>> folderMap;
+        // Read folder ID and UID of messages from the database
+        Map<Long, List<String>> folderMap;
         try {
-            folderMap = localStore.getFoldersAndUids(ids, threadedList);
+            folderMap = localStore.getFolderIdsAndUids(ids, threadedList);
         } catch (MessagingException e) {
             Timber.e(e, "Couldn't get folder name and UID of messages");
             return;
         }
 
         // Loop over all folders
-        for (Entry<String, List<String>> entry : folderMap.entrySet()) {
-            String folderServerId = entry.getKey();
+        for (Entry<Long, List<String>> entry : folderMap.entrySet()) {
+            long folderId = entry.getKey();
+            List<String> uids = entry.getValue();
 
             // Notify listeners of changed folder status
             for (MessagingListener l : getListeners()) {
-                l.folderStatusChanged(account, folderServerId);
+                l.folderStatusChanged(account, folderId);
             }
 
             // TODO: Skip the remote part for all local-only folders
 
             // Send flag change to server
-            queueSetFlag(account, folderServerId, newState, flag, entry.getValue());
+            queueSetFlag(account, folderId, newState, flag, uids);
             processPendingCommands(account);
         }
     }
@@ -1064,36 +1113,22 @@ public class MessagingController {
     /**
      * Set or remove a flag for a set of messages in a specific folder.
      * <p>
-     * <p>
      * The {@link Message} objects passed in are updated to reflect the new flag state.
      * </p>
-     *
-     * @param account
-     *         The account the folder containing the messages belongs to.
-     * @param folderServerId
-     *         The server ID of the folder.
-     * @param messages
-     *         The messages to change the flag for.
-     * @param flag
-     *         The flag to change.
-     * @param newState
-     *         {@code true}, if the flag should be set. {@code false} if it should be removed.
      */
-    public void setFlag(Account account, String folderServerId, List<? extends Message> messages, Flag flag,
-            boolean newState) {
+    public void setFlag(Account account, long folderId, List<LocalMessage> messages, Flag flag, boolean newState) {
         // TODO: Put this into the background, but right now some callers depend on the message
         //       objects being modified right after this method returns.
-        LocalFolder localFolder = null;
         try {
             LocalStore localStore = localStoreProvider.getInstance(account);
-            localFolder = localStore.getFolder(folderServerId);
+            LocalFolder localFolder = localStore.getFolder(folderId);
             localFolder.open();
 
             // Update the messages in the local store
             localFolder.setFlags(messages, Collections.singleton(flag), newState);
 
             for (MessagingListener l : getListeners()) {
-                l.folderStatusChanged(account, folderServerId);
+                l.folderStatusChanged(account, folderId);
             }
 
 
@@ -1104,45 +1139,28 @@ public class MessagingController {
             // TODO: Skip the remote part for all local-only folders
 
             List<String> uids = getUidsFromMessages(messages);
-            queueSetFlag(account, folderServerId, newState, flag, uids);
+            queueSetFlag(account, folderId, newState, flag, uids);
             processPendingCommands(account);
         } catch (MessagingException me) {
             throw new RuntimeException(me);
-        } finally {
-            closeFolder(localFolder);
         }
     }
 
     /**
      * Set or remove a flag for a message referenced by message UID.
-     *
-     * @param account
-     *         The account the folder containing the message belongs to.
-     * @param folderServerId
-     *         The server ID of the folder.
-     * @param uid
-     *         The UID of the message to change the flag for.
-     * @param flag
-     *         The flag to change.
-     * @param newState
-     *         {@code true}, if the flag should be set. {@code false} if it should be removed.
      */
-    public void setFlag(Account account, String folderServerId, String uid, Flag flag,
-            boolean newState) {
-        LocalFolder localFolder = null;
+    public void setFlag(Account account, long folderId, String uid, Flag flag, boolean newState) {
         try {
             LocalStore localStore = localStoreProvider.getInstance(account);
-            localFolder = localStore.getFolder(folderServerId);
+            LocalFolder localFolder = localStore.getFolder(folderId);
             localFolder.open();
 
-            Message message = localFolder.getMessage(uid);
+            LocalMessage message = localFolder.getMessage(uid);
             if (message != null) {
-                setFlag(account, folderServerId, Collections.singletonList(message), flag, newState);
+                setFlag(account, folderId, Collections.singletonList(message), flag, newState);
             }
         } catch (MessagingException me) {
             throw new RuntimeException(me);
-        } finally {
-            closeFolder(localFolder);
         }
     }
 
@@ -1156,34 +1174,26 @@ public class MessagingController {
         }
     }
 
-    public void loadMessageRemotePartial(final Account account, final String folder,
-            final String uid, final MessagingListener listener) {
-        put("loadMessageRemotePartial", listener, new Runnable() {
-            @Override
-            public void run() {
-                loadMessageRemoteSynchronous(account, folder, uid, listener, true);
-            }
-        });
+    public void loadMessageRemotePartial(Account account, long folderId, String uid, MessagingListener listener) {
+        put("loadMessageRemotePartial", listener, () ->
+            loadMessageRemoteSynchronous(account, folderId, uid, listener, true)
+        );
     }
 
     //TODO: Fix the callback mess. See GH-782
-    public void loadMessageRemote(final Account account, final String folder,
-            final String uid, final MessagingListener listener) {
-        put("loadMessageRemote", listener, new Runnable() {
-            @Override
-            public void run() {
-                loadMessageRemoteSynchronous(account, folder, uid, listener, false);
-            }
-        });
+    public void loadMessageRemote(Account account, long folderId, String uid, MessagingListener listener) {
+        put("loadMessageRemote", listener, () ->
+            loadMessageRemoteSynchronous(account, folderId, uid, listener, false)
+        );
     }
 
-    private boolean loadMessageRemoteSynchronous(final Account account, final String folder,
-            final String uid, final MessagingListener listener, final boolean loadPartialFromSearch) {
-        LocalFolder localFolder = null;
+    private void loadMessageRemoteSynchronous(Account account, long folderId, String uid,
+            MessagingListener listener, boolean loadPartialFromSearch) {
         try {
             LocalStore localStore = localStoreProvider.getInstance(account);
-            localFolder = localStore.getFolder(folder);
+            LocalFolder localFolder = localStore.getFolder(folderId);
             localFolder.open();
+            String folderServerId = localFolder.getServerId();
 
             LocalMessage message = localFolder.getMessage(uid);
 
@@ -1202,12 +1212,13 @@ public class MessagingController {
 
                 if (loadPartialFromSearch) {
                     SyncConfig syncConfig = createSyncConfig(account);
-                    backend.downloadMessage(syncConfig, folder, uid);
+                    backend.downloadMessage(syncConfig, folderServerId, uid);
                 } else {
                     FetchProfile fp = new FetchProfile();
                     fp.add(FetchProfile.Item.BODY);
                     fp.add(FetchProfile.Item.FLAGS);
-                    Message remoteMessage = backend.fetchMessage(folder, uid, fp);
+                    int maxDownloadSize = account.getMaximumAutoDownloadMessageSize();
+                    Message remoteMessage = backend.fetchMessage(folderServerId, uid, fp, maxDownloadSize);
                     localFolder.appendMessages(Collections.singletonList(remoteMessage));
                 }
 
@@ -1220,36 +1231,31 @@ public class MessagingController {
 
             // now that we have the full message, refresh the headers
             for (MessagingListener l : getListeners(listener)) {
-                l.loadMessageRemoteFinished(account, folder, uid);
+                l.loadMessageRemoteFinished(account, folderId, uid);
             }
-
-            return true;
         } catch (Exception e) {
             for (MessagingListener l : getListeners(listener)) {
-                l.loadMessageRemoteFailed(account, folder, uid, e);
+                l.loadMessageRemoteFailed(account, folderId, uid, e);
             }
             notifyUserIfCertificateProblem(account, e, true);
             Timber.e(e, "Error while loading remote message");
-            return false;
-        } finally {
-            closeFolder(localFolder);
         }
     }
 
-    public LocalMessage loadMessage(Account account, String folderServerId, String uid) throws MessagingException {
+    public LocalMessage loadMessage(Account account, long folderId, String uid) throws MessagingException {
         LocalStore localStore = localStoreProvider.getInstance(account);
-        LocalFolder localFolder = localStore.getFolder(folderServerId);
+        LocalFolder localFolder = localStore.getFolder(folderId);
         localFolder.open();
 
         LocalMessage message = localFolder.getMessage(uid);
         if (message == null || message.getDatabaseId() == 0) {
-            throw new IllegalArgumentException("Message not found: folder=" + folderServerId + ", uid=" + uid);
+            String folderName = localFolder.getName();
+            throw new IllegalArgumentException("Message not found: folder=" + folderName + ", uid=" + uid);
         }
 
         FetchProfile fp = new FetchProfile();
         fp.add(FetchProfile.Item.BODY);
         localFolder.fetch(Collections.singletonList(message), fp, null);
-        localFolder.close();
 
         notificationController.removeNewMailNotification(account, message.makeMessageReference());
         markMessageAsReadOnView(account, message);
@@ -1257,20 +1263,20 @@ public class MessagingController {
         return message;
     }
 
-    public LocalMessage loadMessageMetadata(Account account, String folderServerId, String uid) throws MessagingException {
+    public LocalMessage loadMessageMetadata(Account account, long folderId, String uid) throws MessagingException {
         LocalStore localStore = localStoreProvider.getInstance(account);
-        LocalFolder localFolder = localStore.getFolder(folderServerId);
+        LocalFolder localFolder = localStore.getFolder(folderId);
         localFolder.open();
 
         LocalMessage message = localFolder.getMessage(uid);
         if (message == null || message.getDatabaseId() == 0) {
-            throw new IllegalArgumentException("Message not found: folder=" + folderServerId + ", uid=" + uid);
+            String folderName = localFolder.getName();
+            throw new IllegalArgumentException("Message not found: folder=" + folderName + ", uid=" + uid);
         }
 
         FetchProfile fp = new FetchProfile();
         fp.add(FetchProfile.Item.ENVELOPE);
         localFolder.fetch(Collections.singletonList(message), fp, null);
-        localFolder.close();
 
         return message;
     }
@@ -1292,12 +1298,11 @@ public class MessagingController {
         put("loadAttachment", listener, new Runnable() {
             @Override
             public void run() {
-                LocalFolder localFolder = null;
                 try {
                     String folderServerId = message.getFolder().getServerId();
 
                     LocalStore localStore = localStoreProvider.getInstance(account);
-                    localFolder = localStore.getFolder(folderServerId);
+                    LocalFolder localFolder = localStore.getFolder(folderServerId);
 
                     ProgressBodyFactory bodyFactory = new ProgressBodyFactory(new ProgressListener() {
                         @Override
@@ -1323,8 +1328,6 @@ public class MessagingController {
                         l.loadAttachmentFailed(account, message, part, me.getMessage());
                     }
                     notifyUserIfCertificateProblem(account, me, true);
-                } finally {
-                    closeFolder(localFolder);
                 }
             }
         });
@@ -1340,7 +1343,7 @@ public class MessagingController {
             MessagingListener listener) {
         try {
             LocalStore localStore = localStoreProvider.getInstance(account);
-            LocalFolder localFolder = localStore.getFolder(account.getOutboxFolder());
+            LocalFolder localFolder = localStore.getFolder(account.getOutboxFolderId());
             localFolder.open();
             localFolder.appendMessages(Collections.singletonList(message));
             LocalMessage localMessage = localFolder.getMessage(message.getUid());
@@ -1349,7 +1352,6 @@ public class MessagingController {
             if (plaintextSubject != null) {
                 localMessage.setCachedDecryptedSubject(plaintextSubject);
             }
-            localFolder.close();
 
             OutboxStateRepository outboxStateRepository = localStore.getOutboxStateRepository();
             outboxStateRepository.initializeOutboxState(messageId);
@@ -1418,10 +1420,8 @@ public class MessagingController {
     }
 
     private boolean messagesPendingSend(final Account account) {
-        LocalFolder localFolder = null;
         try {
-            localFolder = localStoreProvider.getInstance(account).getFolder(
-                    account.getOutboxFolder());
+            LocalFolder localFolder = localStoreProvider.getInstance(account).getFolder(account.getOutboxFolderId());
             if (!localFolder.exists()) {
                 return false;
             }
@@ -1433,8 +1433,6 @@ public class MessagingController {
             }
         } catch (Exception e) {
             Timber.e(e, "Exception while checking for unsent messages");
-        } finally {
-            closeFolder(localFolder);
         }
         return false;
     }
@@ -1444,14 +1442,12 @@ public class MessagingController {
      */
     @VisibleForTesting
     protected void sendPendingMessagesSynchronous(final Account account) {
-        LocalFolder localFolder = null;
         Exception lastFailure = null;
         boolean wasPermanentFailure = false;
         try {
             LocalStore localStore = localStoreProvider.getInstance(account);
             OutboxStateRepository outboxStateRepository = localStore.getOutboxStateRepository();
-            localFolder = localStore.getFolder(
-                    account.getOutboxFolder());
+            LocalFolder localFolder = localStore.getFolder(account.getOutboxFolderId());
             if (!localFolder.exists()) {
                 Timber.v("Outbox does not exist");
                 return;
@@ -1459,11 +1455,13 @@ public class MessagingController {
 
             localFolder.open();
 
+            long outboxFolderId = localFolder.getDatabaseId();
+
             List<LocalMessage> localMessages = localFolder.getMessages(null);
             int progress = 0;
             int todo = localMessages.size();
             for (MessagingListener l : getListeners()) {
-                l.synchronizeMailboxProgress(account, account.getSentFolder(), progress, todo);
+                l.synchronizeMailboxProgress(account, outboxFolderId, progress, todo);
             }
             /*
              * The profile we will use to pull all of the content
@@ -1473,8 +1471,7 @@ public class MessagingController {
             fp.add(FetchProfile.Item.ENVELOPE);
             fp.add(FetchProfile.Item.BODY);
 
-            Timber.i("Scanning folder '%s' (%d) for messages to send",
-                    account.getOutboxFolder(), localFolder.getDatabaseId());
+            Timber.i("Scanning Outbox folder for messages to send");
 
             Backend backend = getBackend(account);
 
@@ -1518,7 +1515,7 @@ public class MessagingController {
                         message.setFlag(Flag.SEEN, true);
                         progress++;
                         for (MessagingListener l : getListeners()) {
-                            l.synchronizeMailboxProgress(account, account.getSentFolder(), progress, todo);
+                            l.synchronizeMailboxProgress(account, outboxFolderId, progress, todo);
                         }
                         moveOrDeleteSentMessage(account, localStore, localFolder, message);
 
@@ -1579,7 +1576,6 @@ public class MessagingController {
             if (lastFailure == null) {
                 notificationController.clearSendFailedNotification(account);
             }
-            closeFolder(localFolder);
         }
     }
 
@@ -1589,14 +1585,17 @@ public class MessagingController {
             Timber.i("Not uploading sent message; deleting local message");
             message.destroy();
         } else {
-            LocalFolder localSentFolder = localStore.getFolder(account.getSentFolder());
-            Timber.i("Moving sent message to folder '%s' (%d)", account.getSentFolder(), localSentFolder.getDatabaseId());
+            long sentFolderId = account.getSentFolderId();
+            LocalFolder sentFolder = localStore.getFolder(sentFolderId);
+            sentFolder.open();
+            String sentFolderServerId = sentFolder.getServerId();
+            Timber.i("Moving sent message to folder '%s' (%d)", sentFolderServerId, sentFolderId);
 
-            localFolder.moveMessages(Collections.singletonList(message), localSentFolder);
+            localFolder.moveMessages(Collections.singletonList(message), sentFolder);
 
-            Timber.i("Moved sent message to folder '%s' (%d)", account.getSentFolder(), localSentFolder.getDatabaseId());
+            Timber.i("Moved sent message to folder '%s' (%d)", sentFolderServerId, sentFolderId);
 
-            PendingCommand command = PendingAppend.create(localSentFolder.getServerId(), message.getUid());
+            PendingCommand command = PendingAppend.create(sentFolderId, message.getUid());
             queuePendingCommand(account, command);
             processPendingCommands(account);
         }
@@ -1612,10 +1611,10 @@ public class MessagingController {
     }
 
     private void notifySynchronizeMailboxFailed(Account account, LocalFolder localFolder, Exception exception) {
-        String folderServerId = localFolder.getServerId();
+        long folderId = localFolder.getDatabaseId();
         String errorMessage = getRootCauseMessage(exception);
         for (MessagingListener listener : getListeners()) {
-            listener.synchronizeMailboxFailed(account, folderServerId, errorMessage);
+            listener.synchronizeMailboxFailed(account, folderId, errorMessage);
         }
     }
 
@@ -1627,29 +1626,9 @@ public class MessagingController {
         return unreadMessageCountProvider.getUnreadMessageCount(searchAccount);
     }
 
-    public void getFolderUnreadMessageCount(final Account account, final String folderServerId,
-            final MessagingListener l) {
-        Runnable unreadRunnable = new Runnable() {
-            @Override
-            public void run() {
-
-                int unreadMessageCount = 0;
-                try {
-                    unreadMessageCount = getFolderUnreadMessageCount(account, folderServerId);
-                } catch (MessagingException me) {
-                    Timber.e(me, "Count not get unread count for account %s", account.getDescription());
-                }
-                l.folderStatusChanged(account, folderServerId);
-            }
-        };
-
-
-        put("getFolderUnread:" + account.getDescription() + ":" + folderServerId, l, unreadRunnable);
-    }
-
-    public int getFolderUnreadMessageCount(Account account, String folderServerId) throws MessagingException {
+    public int getFolderUnreadMessageCount(Account account, Long folderId) throws MessagingException {
         LocalStore localStore = localStoreProvider.getInstance(account);
-        LocalFolder localFolder = localStore.getFolder(folderServerId);
+        LocalFolder localFolder = localStore.getFolder(folderId);
         return localFolder.getUnreadMessageCount();
     }
 
@@ -1697,97 +1676,68 @@ public class MessagingController {
         getBackend(account).checkOutgoingServerSettings();
     }
 
-    public void moveMessages(final Account srcAccount, final String srcFolder,
-            List<MessageReference> messageReferences, final String destFolder) {
-        actOnMessageGroup(srcAccount, srcFolder, messageReferences, new MessageActor() {
-            @Override
-            public void act(final Account account, LocalFolder messageFolder, final List<LocalMessage> messages) {
-                suppressMessages(account, messages);
+    public void moveMessages(Account srcAccount, long srcFolderId,
+            List<MessageReference> messageReferences, long destFolderId) {
+        actOnMessageGroup(srcAccount, srcFolderId, messageReferences, (account, messageFolder, messages) -> {
+            suppressMessages(account, messages);
 
-                putBackground("moveMessages", null, new Runnable() {
-                    @Override
-                    public void run() {
-                        moveOrCopyMessageSynchronous(account, srcFolder, messages, destFolder, MoveOrCopyFlavor.MOVE);
-                    }
-                });
-            }
+            putBackground("moveMessages", null, () ->
+                    moveOrCopyMessageSynchronous(account, srcFolderId, messages, destFolderId, MoveOrCopyFlavor.MOVE)
+            );
         });
     }
 
-    public void moveMessagesInThread(Account srcAccount, final String srcFolder,
-            final List<MessageReference> messageReferences, final String destFolder) {
-        actOnMessageGroup(srcAccount, srcFolder, messageReferences, new MessageActor() {
-            @Override
-            public void act(final Account account, LocalFolder messageFolder, final List<LocalMessage> messages) {
-                suppressMessages(account, messages);
+    public void moveMessagesInThread(Account srcAccount, long srcFolderId,
+            List<MessageReference> messageReferences, long destFolderId) {
+        actOnMessageGroup(srcAccount, srcFolderId, messageReferences, (account, messageFolder, messages) -> {
+            suppressMessages(account, messages);
 
-                putBackground("moveMessagesInThread", null, new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            List<Message> messagesInThreads = collectMessagesInThreads(account, messages);
-                            moveOrCopyMessageSynchronous(account, srcFolder, messagesInThreads, destFolder,
-                                    MoveOrCopyFlavor.MOVE);
-                        } catch (MessagingException e) {
-                            Timber.e(e, "Exception while moving messages");
-                        }
-                    }
-                });
-            }
+            putBackground("moveMessagesInThread", null, () -> {
+                try {
+                    List<LocalMessage> messagesInThreads = collectMessagesInThreads(account, messages);
+                    moveOrCopyMessageSynchronous(account, srcFolderId, messagesInThreads, destFolderId,
+                            MoveOrCopyFlavor.MOVE);
+                } catch (MessagingException e) {
+                    Timber.e(e, "Exception while moving messages");
+                }
+            });
         });
     }
 
-    public void moveMessage(final Account account, final String srcFolder, final MessageReference message,
-            final String destFolder) {
-        moveMessages(account, srcFolder, Collections.singletonList(message), destFolder);
+    public void moveMessage(Account account, long srcFolderId, MessageReference message, long destFolderId) {
+        moveMessages(account, srcFolderId, Collections.singletonList(message), destFolderId);
     }
 
-    public void copyMessages(final Account srcAccount, final String srcFolder,
-            final List<MessageReference> messageReferences, final String destFolder) {
-        actOnMessageGroup(srcAccount, srcFolder, messageReferences, new MessageActor() {
-            @Override
-            public void act(final Account account, LocalFolder messageFolder, final List<LocalMessage> messages) {
-                putBackground("copyMessages", null, new Runnable() {
-                    @Override
-                    public void run() {
-                        moveOrCopyMessageSynchronous(srcAccount, srcFolder, messages, destFolder,
-                                MoveOrCopyFlavor.COPY);
-                    }
-                });
-            }
+    public void copyMessages(Account srcAccount, long srcFolderId,
+            List<MessageReference> messageReferences, long destFolderId) {
+        actOnMessageGroup(srcAccount, srcFolderId, messageReferences, (account, messageFolder, messages) -> {
+            putBackground("copyMessages", null, () ->
+                    moveOrCopyMessageSynchronous(srcAccount, srcFolderId, messages, destFolderId, MoveOrCopyFlavor.COPY)
+            );
         });
     }
 
-    public void copyMessagesInThread(Account srcAccount, final String srcFolder,
-            final List<MessageReference> messageReferences, final String destFolder) {
-        actOnMessageGroup(srcAccount, srcFolder, messageReferences, new MessageActor() {
-            @Override
-            public void act(final Account account, LocalFolder messageFolder, final List<LocalMessage> messages) {
-                putBackground("copyMessagesInThread", null, new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            List<Message> messagesInThreads = collectMessagesInThreads(account, messages);
-                            moveOrCopyMessageSynchronous(account, srcFolder, messagesInThreads, destFolder,
-                                    MoveOrCopyFlavor.COPY);
-                        } catch (MessagingException e) {
-                            Timber.e(e, "Exception while copying messages");
-                        }
-                    }
-                });
-            }
+    public void copyMessagesInThread(Account srcAccount, long srcFolderId,
+            final List<MessageReference> messageReferences, long destFolderId) {
+        actOnMessageGroup(srcAccount, srcFolderId, messageReferences, (account, messageFolder, messages) -> {
+            putBackground("copyMessagesInThread", null, () -> {
+                try {
+                    List<LocalMessage> messagesInThreads = collectMessagesInThreads(account, messages);
+                    moveOrCopyMessageSynchronous(account, srcFolderId, messagesInThreads, destFolderId,
+                            MoveOrCopyFlavor.COPY);
+                } catch (MessagingException e) {
+                    Timber.e(e, "Exception while copying messages");
+                }
+            });
         });
     }
 
-    public void copyMessage(final Account account, final String srcFolder, final MessageReference message,
-            final String destFolder) {
-
-        copyMessages(account, srcFolder, Collections.singletonList(message), destFolder);
+    public void copyMessage(Account account, long srcFolderId, MessageReference message, long destFolderId) {
+        copyMessages(account, srcFolderId, Collections.singletonList(message), destFolderId);
     }
 
-    private void moveOrCopyMessageSynchronous(final Account account, final String srcFolder,
-            final List<? extends Message> inMessages, final String destFolder,
-            MoveOrCopyFlavor operation) {
+    private void moveOrCopyMessageSynchronous(Account account, long srcFolderId, List<LocalMessage> inMessages,
+            long destFolderId, MoveOrCopyFlavor operation) {
 
         try {
             LocalStore localStore = localStoreProvider.getInstance(account);
@@ -1800,8 +1750,11 @@ public class MessagingController {
                 return;
             }
 
-            LocalFolder localSrcFolder = localStore.getFolder(srcFolder);
-            LocalFolder localDestFolder = localStore.getFolder(destFolder);
+            LocalFolder localSrcFolder = localStore.getFolder(srcFolderId);
+            localSrcFolder.open();
+
+            LocalFolder localDestFolder = localStore.getFolder(destFolderId);
+            localDestFolder.open();
 
             boolean unreadCountAffected = false;
             List<String> uids = new LinkedList<>();
@@ -1825,7 +1778,7 @@ public class MessagingController {
                 }
 
                 Timber.i("moveOrCopyMessageSynchronous: source folder = %s, %d messages, destination folder = %s, " +
-                        "operation = %s", srcFolder, messages.size(), destFolder, operation.name());
+                        "operation = %s", srcFolderId, messages.size(), destFolderId, operation.name());
 
                 Map<String, String> uidMap;
 
@@ -1840,7 +1793,7 @@ public class MessagingController {
                         // If this copy operation changes the unread count in the destination
                         // folder, notify the listeners.
                         for (MessagingListener l : getListeners()) {
-                            l.folderStatusChanged(account, destFolder);
+                            l.folderStatusChanged(account, destFolderId);
                         }
                     }
                 } else {
@@ -1849,7 +1802,7 @@ public class MessagingController {
                         String origUid = entry.getKey();
                         Message message = entry.getValue();
                         for (MessagingListener l : getListeners()) {
-                            l.messageUidChanged(account, srcFolder, origUid, message.getUid());
+                            l.messageUidChanged(account, srcFolderId, origUid, message.getUid());
                         }
                     }
                     if (operation == MoveOrCopyFlavor.MOVE_AND_MARK_AS_READ) {
@@ -1864,13 +1817,14 @@ public class MessagingController {
                         int unreadMessageCountSrc = localSrcFolder.getUnreadMessageCount();
                         int unreadMessageCountDest = localDestFolder.getUnreadMessageCount();
                         for (MessagingListener l : getListeners()) {
-                            l.folderStatusChanged(account, srcFolder);
-                            l.folderStatusChanged(account, destFolder);
+                            l.folderStatusChanged(account, srcFolderId);
+                            l.folderStatusChanged(account, destFolderId);
                         }
                     }
                 }
 
-                queueMoveOrCopy(account, srcFolder, destFolder, operation, uidMap);
+                queueMoveOrCopy(account, localSrcFolder.getDatabaseId(), localDestFolder.getDatabaseId(),
+                        operation, uidMap);
             }
 
             processPendingCommands(account);
@@ -1882,74 +1836,63 @@ public class MessagingController {
         }
     }
 
-    public void expunge(final Account account, final String folder) {
-        putBackground("expunge", null, new Runnable() {
-            @Override
-            public void run() {
-                queueExpunge(account, folder);
-            }
+    public void expunge(Account account, long folderId) {
+        putBackground("expunge", null, () -> {
+            queueExpunge(account, folderId);
+            processPendingCommands(account);
         });
     }
 
     public void deleteDraft(final Account account, long id) {
-        LocalFolder localFolder = null;
         try {
+            Long folderId = account.getDraftsFolderId();
+            if (folderId == null) {
+                Timber.w("No Drafts folder configured. Can't delete draft.");
+                return;
+            }
+
             LocalStore localStore = localStoreProvider.getInstance(account);
-            localFolder = localStore.getFolder(account.getDraftsFolder());
+            LocalFolder localFolder = localStore.getFolder(folderId);
             localFolder.open();
             String uid = localFolder.getMessageUidById(id);
             if (uid != null) {
-                MessageReference messageReference = new MessageReference(
-                        account.getUuid(), account.getDraftsFolder(), uid, null);
-                deleteMessage(messageReference, null);
+                MessageReference messageReference = new MessageReference(account.getUuid(), folderId, uid, null);
+                deleteMessage(messageReference);
             }
         } catch (MessagingException me) {
             Timber.e(me, "Error deleting draft");
-        } finally {
-            closeFolder(localFolder);
         }
     }
 
     public void deleteThreads(final List<MessageReference> messages) {
-        actOnMessagesGroupedByAccountAndFolder(messages, new MessageActor() {
-            @Override
-            public void act(final Account account, final LocalFolder messageFolder,
-                    final List<LocalMessage> accountMessages) {
-                suppressMessages(account, accountMessages);
-
-                putBackground("deleteThreads", null, new Runnable() {
-                    @Override
-                    public void run() {
-                        deleteThreadsSynchronous(account, messageFolder.getServerId(), accountMessages);
-                    }
-                });
-            }
+        actOnMessagesGroupedByAccountAndFolder(messages, (account, messageFolder, accountMessages) -> {
+            suppressMessages(account, accountMessages);
+            putBackground("deleteThreads", null, () ->
+                    deleteThreadsSynchronous(account, messageFolder.getDatabaseId(), accountMessages)
+            );
         });
     }
 
-    private void deleteThreadsSynchronous(Account account, String folderServerId, List<? extends Message> messages) {
+    private void deleteThreadsSynchronous(Account account, long folderId, List<LocalMessage> messages) {
         try {
-            List<Message> messagesToDelete = collectMessagesInThreads(account, messages);
-
-            deleteMessagesSynchronous(account, folderServerId,
-                    messagesToDelete, null);
+            List<LocalMessage> messagesToDelete = collectMessagesInThreads(account, messages);
+            deleteMessagesSynchronous(account, folderId, messagesToDelete);
         } catch (MessagingException e) {
             Timber.e(e, "Something went wrong while deleting threads");
         }
     }
 
-    private List<Message> collectMessagesInThreads(Account account, List<? extends Message> messages)
+    private List<LocalMessage> collectMessagesInThreads(Account account, List<LocalMessage> messages)
             throws MessagingException {
 
         LocalStore localStore = localStoreProvider.getInstance(account);
 
-        List<Message> messagesInThreads = new ArrayList<>();
-        for (Message message : messages) {
-            LocalMessage localMessage = (LocalMessage) message;
+        List<LocalMessage> messagesInThreads = new ArrayList<>();
+        for (LocalMessage localMessage : messages) {
             long rootId = localMessage.getRootId();
             long threadId = (rootId == -1) ? localMessage.getThreadId() : rootId;
 
-            List<? extends Message> messagesInThread = localStore.getMessagesInThread(threadId);
+            List<LocalMessage> messagesInThread = localStore.getMessagesInThread(threadId);
 
             messagesInThreads.addAll(messagesInThread);
         }
@@ -1957,26 +1900,16 @@ public class MessagingController {
         return messagesInThreads;
     }
 
-    public void deleteMessage(MessageReference message, final MessagingListener listener) {
-        deleteMessages(Collections.singletonList(message), listener);
+    public void deleteMessage(MessageReference message) {
+        deleteMessages(Collections.singletonList(message));
     }
 
-    public void deleteMessages(List<MessageReference> messages, final MessagingListener listener) {
-        actOnMessagesGroupedByAccountAndFolder(messages, new MessageActor() {
-
-            @Override
-            public void act(final Account account, final LocalFolder messageFolder,
-                    final List<LocalMessage> accountMessages) {
-                suppressMessages(account, accountMessages);
-
-                putBackground("deleteMessages", null, new Runnable() {
-                    @Override
-                    public void run() {
-                        deleteMessagesSynchronous(account, messageFolder.getServerId(), accountMessages, listener);
-                    }
-                });
-            }
-
+    public void deleteMessages(List<MessageReference> messages) {
+        actOnMessagesGroupedByAccountAndFolder(messages, (account, messageFolder, accountMessages) -> {
+            suppressMessages(account, accountMessages);
+            putBackground("deleteMessages", null, () ->
+                    deleteMessagesSynchronous(account, messageFolder.getDatabaseId(), accountMessages)
+            );
         });
     }
 
@@ -2009,16 +1942,12 @@ public class MessagingController {
 
     }
 
-    private void deleteMessagesSynchronous(final Account account, final String folder,
-            final List<? extends Message> messages,
-            MessagingListener listener) {
-        LocalFolder localFolder = null;
-        LocalFolder localTrashFolder = null;
+    private void deleteMessagesSynchronous(Account account, long folderId, List<LocalMessage> messages) {
         try {
-            List<Message> localOnlyMessages = new ArrayList<>();
-            List<Message> syncedMessages = new ArrayList<>();
+            List<LocalMessage> localOnlyMessages = new ArrayList<>();
+            List<LocalMessage> syncedMessages = new ArrayList<>();
             List<String> syncedMessageUids = new ArrayList<>();
-            for (Message message : messages) {
+            for (LocalMessage message : messages) {
                 String uid = message.getUid();
                 if (uid.startsWith(K9.LOCAL_UID_PREFIX)) {
                     localOnlyMessages.add(message);
@@ -2031,10 +1960,14 @@ public class MessagingController {
             Backend backend = getBackend(account);
 
             LocalStore localStore = localStoreProvider.getInstance(account);
-            localFolder = localStore.getFolder(folder);
+            LocalFolder localFolder = localStore.getFolder(folderId);
+            localFolder.open();
+
             Map<String, String> uidMap = null;
-            if (folder.equals(account.getTrashFolder()) || !account.hasTrashFolder() ||
-                    !backend.isDeleteMoveToTrash()) {
+            Long trashFolderId = account.getTrashFolderId();
+            LocalFolder localTrashFolder = null;
+            if (!account.hasTrashFolder() || folderId == trashFolderId ||
+                    (backend.getSupportsTrashFolder() && !backend.isDeleteMoveToTrash())) {
                 Timber.d("Not moving deleted messages to local Trash folder. Removing local copies.");
 
                 if (!localOnlyMessages.isEmpty()) {
@@ -2045,7 +1978,7 @@ public class MessagingController {
                 }
             } else {
                 Timber.d("Deleting messages in normal folder, moving");
-                localTrashFolder = localStore.getFolder(account.getTrashFolder());
+                localTrashFolder = localStore.getFolder(trashFolderId);
                 uidMap = localFolder.moveMessages(messages, localTrashFolder);
 
                 if (account.isMarkMessageAsReadOnDelete()) {
@@ -2054,37 +1987,38 @@ public class MessagingController {
             }
 
             for (MessagingListener l : getListeners()) {
-                l.folderStatusChanged(account, folder);
+                l.folderStatusChanged(account, folderId);
                 if (localTrashFolder != null) {
-                    l.folderStatusChanged(account, account.getTrashFolder());
+                    l.folderStatusChanged(account, trashFolderId);
                 }
             }
 
             Timber.d("Delete policy for account %s is %s", account.getDescription(), account.getDeletePolicy());
 
-            if (folder.equals(account.getOutboxFolder())) {
+            Long outboxFolderId = account.getOutboxFolderId();
+            if (outboxFolderId != null && folderId == outboxFolderId) {
                 for (Message message : messages) {
                     // If the message was in the Outbox, then it has been copied to local Trash, and has
                     // to be copied to remote trash
-                    PendingCommand command = PendingAppend.create(account.getTrashFolder(), message.getUid());
+                    PendingCommand command = PendingAppend.create(trashFolderId, message.getUid());
                     queuePendingCommand(account, command);
                 }
                 processPendingCommands(account);
             } else if (!syncedMessageUids.isEmpty()) {
                 if (account.getDeletePolicy() == DeletePolicy.ON_DELETE) {
-                    if (!account.hasTrashFolder() || folder.equals(account.getTrashFolder()) ||
+                    if (!account.hasTrashFolder() || folderId == trashFolderId ||
                             !backend.isDeleteMoveToTrash()) {
-                        queueDelete(account, folder, syncedMessageUids);
+                        queueDelete(account, folderId, syncedMessageUids);
                     } else if (account.isMarkMessageAsReadOnDelete()) {
-                        queueMoveOrCopy(account, folder, account.getTrashFolder(),
+                        queueMoveOrCopy(account, folderId, trashFolderId,
                                 MoveOrCopyFlavor.MOVE_AND_MARK_AS_READ, uidMap);
                     } else {
-                        queueMoveOrCopy(account, folder, account.getTrashFolder(),
+                        queueMoveOrCopy(account, folderId, trashFolderId,
                                 MoveOrCopyFlavor.MOVE, uidMap);
                     }
                     processPendingCommands(account);
                 } else if (account.getDeletePolicy() == DeletePolicy.MARK_AS_READ) {
-                    queueSetFlag(account, folder, true, Flag.SEEN, syncedMessageUids);
+                    queueSetFlag(account, localFolder.getDatabaseId(), true, Flag.SEEN, syncedMessageUids);
                     processPendingCommands(account);
                 } else {
                     Timber.d("Delete policy %s prevents delete from server", account.getDeletePolicy());
@@ -2097,13 +2031,10 @@ public class MessagingController {
             throw new UnavailableAccountException(e);
         } catch (MessagingException me) {
             throw new RuntimeException("Error deleting message from local store.", me);
-        } finally {
-            closeFolder(localFolder);
-            closeFolder(localTrashFolder);
         }
     }
 
-    private static List<String> getUidsFromMessages(List<? extends Message> messages) {
+    private static List<String> getUidsFromMessages(List<LocalMessage> messages) {
         List<String> uids = new ArrayList<>(messages.size());
         for (int i = 0; i < messages.size(); i++) {
             uids.add(messages.get(i).getUid());
@@ -2116,21 +2047,21 @@ public class MessagingController {
             return;
         }
 
-        Backend backend = getBackend(account);
+        long trashFolderId = account.getTrashFolderId();
+        LocalStore localStore = localStoreProvider.getInstance(account);
+        LocalFolder folder = localStore.getFolder(trashFolderId);
+        folder.open();
+        String trashFolderServerId = folder.getServerId();
 
-        String trashFolderServerId = account.getTrashFolder();
+        Backend backend = getBackend(account);
         backend.deleteAllMessages(trashFolderServerId);
 
         if (account.getExpungePolicy() == Expunge.EXPUNGE_IMMEDIATELY && backend.getSupportsExpunge()) {
             backend.expunge(trashFolderServerId);
         }
 
-        // When we empty trash, we need to actually synchronize the folder
-        // or local deletes will never get cleaned up
-        LocalStore localStore = localStoreProvider.getInstance(account);
-        LocalFolder folder = localStore.getFolder(trashFolderServerId);
-        folder.open();
-        synchronizeFolder(account, folder, true, 0, null);
+        // Remove all messages marked as deleted
+        folder.destroyDeletedMessages();
 
         compact(account, null);
     }
@@ -2139,22 +2070,27 @@ public class MessagingController {
         putBackground("emptyTrash", listener, new Runnable() {
             @Override
             public void run() {
-                LocalFolder localFolder = null;
                 try {
+                    Long trashFolderId = account.getTrashFolderId();
+                    if (trashFolderId == null) {
+                        Timber.w("No Trash folder configured. Can't empty trash.");
+                        return;
+                    }
+
                     LocalStore localStore = localStoreProvider.getInstance(account);
-                    String trashFolderServerId = account.getTrashFolder();
-                    localFolder = localStore.getFolder(trashFolderServerId);
+                    LocalFolder localFolder = localStore.getFolder(trashFolderId);
                     localFolder.open();
 
                     boolean isTrashLocalOnly = isTrashLocalOnly(account);
                     if (isTrashLocalOnly) {
                         localFolder.clearAllMessages();
                     } else {
+                        localFolder.destroyLocalOnlyMessages();
                         localFolder.setFlags(Collections.singleton(Flag.DELETED), true);
                     }
 
                     for (MessagingListener l : getListeners()) {
-                        l.folderStatusChanged(account, trashFolderServerId);
+                        l.folderStatusChanged(account, trashFolderId);
                     }
 
                     if (!isTrashLocalOnly) {
@@ -2167,27 +2103,21 @@ public class MessagingController {
                     throw new UnavailableAccountException(e);
                 } catch (Exception e) {
                     Timber.e(e, "emptyTrash failed");
-                } finally {
-                    closeFolder(localFolder);
                 }
             }
         });
     }
 
-    public void clearFolder(final Account account, final String folderServerId, final MessagingListener listener) {
-        putBackground("clearFolder", listener, new Runnable() {
-            @Override
-            public void run() {
-                clearFolderSynchronous(account, folderServerId, listener);
-            }
-        });
+    public void clearFolder(Account account, long folderId) {
+        putBackground("clearFolder", null, () ->
+                clearFolderSynchronous(account, folderId)
+        );
     }
 
     @VisibleForTesting
-    protected void clearFolderSynchronous(Account account, String folderServerId, MessagingListener listener) {
-        LocalFolder localFolder = null;
+    protected void clearFolderSynchronous(Account account, long folderId) {
         try {
-            localFolder = localStoreProvider.getInstance(account).getFolder(folderServerId);
+            LocalFolder localFolder = localStoreProvider.getInstance(account).getFolder(folderId);
             localFolder.open();
             localFolder.clearAllMessages();
         } catch (UnavailableStorageException e) {
@@ -2195,8 +2125,6 @@ public class MessagingController {
             throw new UnavailableAccountException(e);
         } catch (Exception e) {
             Timber.e(e, "clearFolder failed");
-        } finally {
-            closeFolder(localFolder);
         }
     }
 
@@ -2261,23 +2189,39 @@ public class MessagingController {
         context.startActivity(chooserIntent);
     }
 
-    public void checkMailBlocking(Account account) {
+    public boolean performPeriodicMailSync(Account account) {
         final CountDownLatch latch = new CountDownLatch(1);
-        checkMail(context, account, true, false, new SimpleMessagingListener() {
+        MutableBoolean syncError = new MutableBoolean(false);
+        checkMail(context, account, false, false, new SimpleMessagingListener() {
             @Override
             public void checkMailFinished(Context context, Account account) {
                 latch.countDown();
             }
+
+            @Override
+            public void synchronizeMailboxFailed(Account account, long folderId, String message) {
+                syncError.setValue(true);
+            }
         });
 
-        Timber.v("checkMailBlocking(%s) about to await latch release", account.getDescription());
+        Timber.v("performPeriodicMailSync(%s) about to await latch release", account.getDescription());
 
         try {
             latch.await();
-            Timber.v("checkMailBlocking(%s) got latch release", account.getDescription());
+            Timber.v("performPeriodicMailSync(%s) got latch release", account.getDescription());
         } catch (Exception e) {
             Timber.e(e, "Interrupted while awaiting latch release");
         }
+
+        boolean success = !syncError.getValue();
+        if (success) {
+            long now = System.currentTimeMillis();
+            Timber.v("Account %s successfully synced @ %tc", account, now);
+            account.setLastSyncTime(now);
+            Preferences.getPreferences(context).saveAccount(account);
+        }
+
+        return success;
     }
 
     /**
@@ -2354,11 +2298,6 @@ public class MessagingController {
             Timber.i("Skipping synchronizing unavailable account %s", account.getDescription());
             return;
         }
-        final long accountInterval = account.getAutomaticCheckIntervalMinutes() * 60 * 1000;
-        if (!ignoreLastCheckedTime && accountInterval <= 0) {
-            Timber.i("Skipping synchronizing account %s", account.getDescription());
-            return;
-        }
 
         Timber.i("Synchronizing account %s", account.getDescription());
 
@@ -2400,7 +2339,7 @@ public class MessagingController {
 
                     continue;
                 }
-                synchronizeFolder(account, folder, ignoreLastCheckedTime, accountInterval, listener);
+                synchronizeFolder(account, folder, ignoreLastCheckedTime, listener);
             }
         } catch (MessagingException e) {
             Timber.e(e, "Unable to synchronize account %s", account.getName());
@@ -2422,57 +2361,47 @@ public class MessagingController {
 
     }
 
+    private void synchronizeFolder(Account account, LocalFolder folder, boolean ignoreLastCheckedTime,
+            MessagingListener listener) {
+        putBackground("sync" + folder.getServerId(), null, () -> {
+            synchronizeFolderInBackground(account, folder, ignoreLastCheckedTime, listener);
+        });
+    }
 
-    private void synchronizeFolder(
-            final Account account,
-            final LocalFolder folder,
-            final boolean ignoreLastCheckedTime,
-            final long accountInterval,
-            final MessagingListener listener) {
-
+    private void synchronizeFolderInBackground(Account account, LocalFolder folder, boolean ignoreLastCheckedTime,
+            MessagingListener listener) {
         Timber.v("Folder %s was last synced @ %tc", folder.getServerId(), folder.getLastChecked());
 
-        if (!ignoreLastCheckedTime && folder.getLastChecked() > System.currentTimeMillis() - accountInterval) {
-            Timber.v("Not syncing folder %s, previously synced @ %tc which would be too recent for the account " +
-                    "period", folder.getServerId(), folder.getLastChecked());
-            return;
+        if (!ignoreLastCheckedTime) {
+            long lastCheckedTime = folder.getLastChecked();
+            long now = System.currentTimeMillis();
+
+            if (lastCheckedTime > now) {
+                // The time this folder was last checked lies in the future. We better ignore this and sync now.
+            } else {
+                long syncInterval = account.getAutomaticCheckIntervalMinutes() * 60L * 1000L;
+                long nextSyncTime = lastCheckedTime + syncInterval;
+                if (nextSyncTime > now) {
+                    Timber.v("Not syncing folder %s, previously synced @ %tc which would be too recent for the " +
+                            "account sync interval", folder.getServerId(), lastCheckedTime);
+                    return;
+                }
+            }
         }
 
-        putBackground("sync" + folder.getServerId(), null, new Runnable() {
-                    @Override
-                    public void run() {
-                        LocalFolder tLocalFolder = null;
-                        try {
-                            // In case multiple Commands get enqueued, don't run more than
-                            // once
-                            final LocalStore localStore = localStoreProvider.getInstance(account);
-                            tLocalFolder = localStore.getFolder(folder.getServerId());
-                            tLocalFolder.open();
+        try {
+            showFetchingMailNotificationIfNecessary(account, folder);
+            try {
+                synchronizeMailboxSynchronous(account, folder.getDatabaseId(), listener);
 
-                            if (!ignoreLastCheckedTime && tLocalFolder.getLastChecked() >
-                                    (System.currentTimeMillis() - accountInterval)) {
-                                Timber.v("Not running Command for folder %s, previously synced @ %tc which would " +
-                                        "be too recent for the account period",
-                                        folder.getServerId(), folder.getLastChecked());
-                                return;
-                            }
-                            showFetchingMailNotificationIfNecessary(account, folder);
-                            try {
-                                synchronizeMailboxSynchronous(account, folder.getServerId(), listener);
-                            } finally {
-                                clearFetchingMailNotificationIfNecessary(account);
-                            }
-                        } catch (Exception e) {
-                            Timber.e(e, "Exception while processing folder %s:%s",
-                                    account.getDescription(), folder.getServerId());
-                        } finally {
-                            closeFolder(tLocalFolder);
-                        }
-                    }
-                }
-        );
-
-
+                long now = System.currentTimeMillis();
+                folder.setLastChecked(now);
+            } finally {
+                clearFetchingMailNotificationIfNecessary(account);
+            }
+        } catch (Exception e) {
+            Timber.e(e, "Exception while processing folder %s:%s", account.getDescription(), folder.getServerId());
+        }
     }
 
     private void showFetchingMailNotificationIfNecessary(Account account, LocalFolder folder) {
@@ -2574,8 +2503,13 @@ public class MessagingController {
     public Message saveDraft(final Account account, final Message message, long existingDraftId, String plaintextSubject, boolean saveRemotely) {
         LocalMessage localMessage = null;
         try {
+            Long draftsFolderId = account.getDraftsFolderId();
+            if (draftsFolderId == null) {
+                throw new IllegalStateException("No Drafts folder configured");
+            }
+
             LocalStore localStore = localStoreProvider.getInstance(account);
-            LocalFolder localFolder = localStore.getFolder(account.getDraftsFolder());
+            LocalFolder localFolder = localStore.getFolder(draftsFolderId);
             localFolder.open();
 
             if (existingDraftId != INVALID_MESSAGE_ID) {
@@ -2593,7 +2527,7 @@ public class MessagingController {
             }
 
             if (saveRemotely) {
-                PendingCommand command = PendingAppend.create(localFolder.getServerId(), localMessage.getUid());
+                PendingCommand command = PendingAppend.create(localFolder.getDatabaseId(), localMessage.getUid());
                 queuePendingCommand(account, command);
                 processPendingCommands(account);
             }
@@ -2678,42 +2612,42 @@ public class MessagingController {
     }
 
     private void actOnMessagesGroupedByAccountAndFolder(List<MessageReference> messages, MessageActor actor) {
-        Map<String, Map<String, List<MessageReference>>> accountMap = groupMessagesByAccountAndFolder(messages);
+        Map<String, Map<Long, List<MessageReference>>> accountMap = groupMessagesByAccountAndFolder(messages);
 
-        for (Map.Entry<String, Map<String, List<MessageReference>>> entry : accountMap.entrySet()) {
+        for (Map.Entry<String, Map<Long, List<MessageReference>>> entry : accountMap.entrySet()) {
             String accountUuid = entry.getKey();
             Account account = Preferences.getPreferences(context).getAccount(accountUuid);
 
-            Map<String, List<MessageReference>> folderMap = entry.getValue();
-            for (Map.Entry<String, List<MessageReference>> folderEntry : folderMap.entrySet()) {
-                String folderServerId = folderEntry.getKey();
+            Map<Long, List<MessageReference>> folderMap = entry.getValue();
+            for (Map.Entry<Long, List<MessageReference>> folderEntry : folderMap.entrySet()) {
+                long folderId = folderEntry.getKey();
                 List<MessageReference> messageList = folderEntry.getValue();
-                actOnMessageGroup(account, folderServerId, messageList, actor);
+                actOnMessageGroup(account, folderId, messageList, actor);
             }
         }
     }
 
     @NonNull
-    private Map<String, Map<String, List<MessageReference>>> groupMessagesByAccountAndFolder(
+    private Map<String, Map<Long, List<MessageReference>>> groupMessagesByAccountAndFolder(
             List<MessageReference> messages) {
-        Map<String, Map<String, List<MessageReference>>> accountMap = new HashMap<>();
+        Map<String, Map<Long, List<MessageReference>>> accountMap = new HashMap<>();
 
         for (MessageReference message : messages) {
             if (message == null) {
                 continue;
             }
             String accountUuid = message.getAccountUuid();
-            String folderServerId = message.getFolderServerId();
+            long folderId = message.getFolderId();
 
-            Map<String, List<MessageReference>> folderMap = accountMap.get(accountUuid);
+            Map<Long, List<MessageReference>> folderMap = accountMap.get(accountUuid);
             if (folderMap == null) {
                 folderMap = new HashMap<>();
                 accountMap.put(accountUuid, folderMap);
             }
-            List<MessageReference> messageList = folderMap.get(folderServerId);
+            List<MessageReference> messageList = folderMap.get(folderId);
             if (messageList == null) {
                 messageList = new LinkedList<>();
-                folderMap.put(folderServerId, messageList);
+                folderMap.put(folderId, messageList);
             }
 
             messageList.add(message);
@@ -2722,9 +2656,9 @@ public class MessagingController {
     }
 
     private void actOnMessageGroup(
-            Account account, String folderServerId, List<MessageReference> messageReferences, MessageActor actor) {
+            Account account, long folderId, List<MessageReference> messageReferences, MessageActor actor) {
         try {
-            LocalFolder messageFolder = localStoreProvider.getInstance(account).getFolder(folderServerId);
+            LocalFolder messageFolder = localStoreProvider.getInstance(account).getFolder(folderId);
             List<LocalMessage> localMessages = messageFolder.getMessagesByReference(messageReferences);
             actor.act(account, messageFolder, localMessages);
         } catch (MessagingException e) {
@@ -2755,8 +2689,9 @@ public class MessagingController {
 
         @Override
         public void syncStarted(@NotNull String folderServerId) {
+            long folderId = getFolderIdOrThrow(account, folderServerId);
             for (MessagingListener messagingListener : getListeners(listener)) {
-                messagingListener.synchronizeMailboxStarted(account, folderServerId);
+                messagingListener.synchronizeMailboxStarted(account, folderId);
             }
         }
 
@@ -2790,8 +2725,9 @@ public class MessagingController {
 
         @Override
         public void syncProgress(@NotNull String folderServerId, int completed, int total) {
+            long folderId = getFolderIdOrThrow(account, folderServerId);
             for (MessagingListener messagingListener : getListeners(listener)) {
-                messagingListener.synchronizeMailboxProgress(account, folderServerId, completed, total);
+                messagingListener.synchronizeMailboxProgress(account, folderId, completed, total);
             }
         }
 
@@ -2803,6 +2739,7 @@ public class MessagingController {
             LocalMessage message = loadMessage(folderServerId, messageServerId);
             LocalFolder localFolder = message.getFolder();
             if (notificationStrategy.shouldNotifyForMessage(account, localFolder, message, isOldMessage)) {
+                Timber.v("Creating notification for message %s:%s", localFolder.getName(), message.getUid());
                 // Notify with the localMessage so that we don't have to recalculate the content preview.
                 notificationController.addNewMailNotification(account, message, previousUnreadMessageCount);
             }
@@ -2843,8 +2780,9 @@ public class MessagingController {
 
         @Override
         public void syncFinished(@NotNull String folderServerId) {
+            long folderId = getFolderIdOrThrow(account, folderServerId);
             for (MessagingListener messagingListener : getListeners(listener)) {
-                messagingListener.synchronizeMailboxFinished(account, folderServerId);
+                messagingListener.synchronizeMailboxFinished(account, folderId);
             }
         }
 
@@ -2858,15 +2796,17 @@ public class MessagingController {
                 notifyUserIfCertificateProblem(account, exception, true);
             }
 
+            long folderId = getFolderIdOrThrow(account, folderServerId);
             for (MessagingListener messagingListener : getListeners(listener)) {
-                messagingListener.synchronizeMailboxFailed(account, folderServerId, message);
+                messagingListener.synchronizeMailboxFailed(account, folderId, message);
             }
         }
 
         @Override
         public void folderStatusChanged(@NotNull String folderServerId) {
+            long folderId = getFolderIdOrThrow(account, folderServerId);
             for (MessagingListener messagingListener : getListeners(listener)) {
-                messagingListener.folderStatusChanged(account, folderServerId);
+                messagingListener.folderStatusChanged(account, folderId);
             }
         }
 
