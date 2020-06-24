@@ -730,7 +730,18 @@ public class MessagingController {
                     } else {
                         throw me;
                     }
+                } catch (Exception e) {
+                    Timber.e("Unexpected exception with command '%s', removing command from queue", command);
+                    localStore.removePendingCommand(processingCommand);
+
+                    if (K9.DEVELOPER_MODE) {
+                        throw new AssertionError("Unexpected exception while processing pending command", e);
+                    }
                 }
+
+                // TODO: When removing a pending command due to an error the local changes should be reverted. Pending
+                //  commands that depend on this command should be canceled and local changes be reverted. In most cases
+                //  the user should be notified about the failure as well.
             }
         } catch (MessagingException me) {
             notifyUserIfCertificateProblem(account, me, true);
@@ -1021,7 +1032,7 @@ public class MessagingController {
         }
 
         Backend backend = getBackend(account);
-        if (backend.getSupportsSeenFlag()) {
+        if (backend.getSupportsFlags()) {
             backend.markAllAsRead(folderServerId);
         }
     }
@@ -1092,6 +1103,8 @@ public class MessagingController {
             return;
         }
 
+        boolean accountSupportsFlags = supportsFlags(account);
+
         // Loop over all folders
         for (Entry<Long, List<String>> entry : folderMap.entrySet()) {
             long folderId = entry.getKey();
@@ -1102,11 +1115,19 @@ public class MessagingController {
                 l.folderStatusChanged(account, folderId);
             }
 
-            // TODO: Skip the remote part for all local-only folders
-
-            // Send flag change to server
-            queueSetFlag(account, folderId, newState, flag, uids);
-            processPendingCommands(account);
+            if (accountSupportsFlags) {
+                LocalFolder localFolder = localStore.getFolder(folderId);
+                try {
+                    localFolder.open();
+                    if (!localFolder.isLocalOnly()) {
+                        // Send flag change to server
+                        queueSetFlag(account, folderId, newState, flag, uids);
+                        processPendingCommands(account);
+                    }
+                } catch (MessagingException e) {
+                    Timber.e(e, "Couldn't open folder. Account: %s, folder ID: %d", account, folderId);
+                }
+            }
         }
     }
 
@@ -1131,16 +1152,12 @@ public class MessagingController {
                 l.folderStatusChanged(account, folderId);
             }
 
-
-            /*
-             * Handle the remote side
-             */
-
-            // TODO: Skip the remote part for all local-only folders
-
-            List<String> uids = getUidsFromMessages(messages);
-            queueSetFlag(account, folderId, newState, flag, uids);
-            processPendingCommands(account);
+            // Handle the remote side
+            if (supportsFlags(account) && !localFolder.isLocalOnly()) {
+                List<String> uids = getUidsFromMessages(messages);
+                queueSetFlag(account, folderId, newState, flag, uids);
+                processPendingCommands(account);
+            }
         } catch (MessagingException me) {
             throw new RuntimeException(me);
         }
@@ -1595,9 +1612,11 @@ public class MessagingController {
 
             Timber.i("Moved sent message to folder '%s' (%d)", sentFolderServerId, sentFolderId);
 
-            PendingCommand command = PendingAppend.create(sentFolderId, message.getUid());
-            queuePendingCommand(account, command);
-            processPendingCommands(account);
+            if (!sentFolder.isLocalOnly()) {
+                PendingCommand command = PendingAppend.create(sentFolderId, message.getUid());
+                queuePendingCommand(account, command);
+                processPendingCommands(account);
+            }
         }
     }
 
@@ -1652,8 +1671,8 @@ public class MessagingController {
         return getBackend(account).isPushCapable();
     }
 
-    public boolean supportsSeenFlag(Account account) {
-        return getBackend(account).getSupportsSeenFlag();
+    public boolean supportsFlags(Account account) {
+        return getBackend(account).getSupportsFlags();
     }
 
     public boolean supportsExpunge(Account account) {
@@ -1996,7 +2015,7 @@ public class MessagingController {
             Timber.d("Delete policy for account %s is %s", account.getDescription(), account.getDeletePolicy());
 
             Long outboxFolderId = account.getOutboxFolderId();
-            if (outboxFolderId != null && folderId == outboxFolderId) {
+            if (outboxFolderId != null && folderId == outboxFolderId && supportsUpload(account)) {
                 for (Message message : messages) {
                     // If the message was in the Outbox, then it has been copied to local Trash, and has
                     // to be copied to remote trash
@@ -2004,6 +2023,8 @@ public class MessagingController {
                     queuePendingCommand(account, command);
                 }
                 processPendingCommands(account);
+            } else if (localFolder.isLocalOnly()) {
+                // Nothing to do on the remote side
             } else if (!syncedMessageUids.isEmpty()) {
                 if (account.getDeletePolicy() == DeletePolicy.ON_DELETE) {
                     if (!account.hasTrashFolder() || folderId == trashFolderId ||
@@ -2526,7 +2547,7 @@ public class MessagingController {
                 localMessage.setCachedDecryptedSubject(plaintextSubject);
             }
 
-            if (saveRemotely) {
+            if (saveRemotely && supportsUpload(account)) {
                 PendingCommand command = PendingAppend.create(localFolder.getDatabaseId(), localMessage.getUid());
                 queuePendingCommand(account, command);
                 processPendingCommands(account);
